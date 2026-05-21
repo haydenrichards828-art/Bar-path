@@ -35,3 +35,4 @@ Then trigger a Netlify redeploy.
 ## Test It
 Visit: `https://your-railway-url.up.railway.app/health`
 Should return: `{"status":"ok","version":"1.0"}`
+# ForceTrack Bar Path API
