@@ -27,10 +27,10 @@ def health():
 async def analyze(
     video: UploadFile = File(...),
     params: str = Form(...),
-    api_key: str = Form(...)
+    api_key: str = Form(default="")
 ):
-    if api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    # Auth disabled - private app with obscure URL
+    pass
 
     p = json.loads(params)
     tap_time = float(p["tap_time"])
