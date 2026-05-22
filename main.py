@@ -60,7 +60,7 @@ async def analyze(
         vid_portrait = raw_h > raw_w
         rotation = None
         if cap_portrait and not vid_portrait:
-            rotation = cv2.ROTATE_90_CLOCKWISE
+            rotation = cv2.ROTATE_90_COUNTERCLOCKWISE
             vid_w, vid_h = raw_h, raw_w          # dimensions after rotation
         elif not cap_portrait and vid_portrait:
             rotation = cv2.ROTATE_90_COUNTERCLOCKWISE
