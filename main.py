@@ -15,12 +15,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-API_KEY = os.environ.get("BARPATH_API_KEY", "change-me")
-
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "1.0"}
+    return {"status": "ok", "version": "2.0"}
 
 
 @app.post("/analyze")
@@ -29,129 +27,121 @@ async def analyze(
     params: str = Form(...),
     api_key: str = Form(default="")
 ):
-    # Auth disabled - private app with obscure URL
-    pass
-
     p = json.loads(params)
-    tap_time = float(p["tap_time"])
-    cap_w = int(p["cap_w"])
-    cap_h = int(p["cap_h"])
-    orig_cx = float(p["orig_cx"])
-    orig_cy = float(p["orig_cy"])
-    box_hw = float(p["box_hw"])
-    box_hh = float(p["box_hh"])
-    dot_offset_x = float(p["dot_offset_x"])
-    dot_offset_y = float(p["dot_offset_y"])
+    tap_time    = float(p["tap_time"])
+    cap_w       = int(p["cap_w"])
+    cap_h       = int(p["cap_h"])
+    orig_cx     = float(p["orig_cx"])
+    orig_cy     = float(p["orig_cy"])
+    box_hw      = float(p["box_hw"])
+    box_hh      = float(p["box_hh"])
+    dot_off_x   = float(p["dot_offset_x"])
+    dot_off_y   = float(p["dot_offset_y"])
 
-    # Save video to temp file
     content = await video.read()
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         f.write(content)
-        tmp_path = f.name
+        tmp = f.name
 
     try:
-        cap = cv2.VideoCapture(tmp_path)
+        cap = cv2.VideoCapture(tmp)
         if not cap.isOpened():
-            raise HTTPException(status_code=400, detail="Cannot open video file")
+            raise HTTPException(status_code=400, detail="Cannot open video")
 
-        fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
-        vid_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        vid_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps      = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
+        raw_w    = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        raw_h    = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total    = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # Scale factors: capture canvas coords → video pixel coords
+        # ── Rotation fix ────────────────────────────────────────────────────
+        # iPhones store portrait video with a rotation flag that OpenCV on
+        # Linux ignores.  Detect the mismatch and rotate frames to match.
+        cap_portrait = cap_h > cap_w
+        vid_portrait = raw_h > raw_w
+        rotation = None
+        if cap_portrait and not vid_portrait:
+            rotation = cv2.ROTATE_90_CLOCKWISE
+            vid_w, vid_h = raw_h, raw_w          # dimensions after rotation
+        elif not cap_portrait and vid_portrait:
+            rotation = cv2.ROTATE_90_COUNTERCLOCKWISE
+            vid_w, vid_h = raw_h, raw_w
+        else:
+            vid_w, vid_h = raw_w, raw_h
+
+        def get_gray(frame):
+            if rotation is not None:
+                frame = cv2.rotate(frame, rotation)
+            return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # ── Scale: capture-coords  ↔  video-pixels ──────────────────────────
         sx = vid_w / cap_w
         sy = vid_h / cap_h
 
-        # Bounding box in video pixel coordinates
+        # Bounding box in video-pixel coords
         bx = max(0, int((orig_cx - box_hw) * sx))
         by = max(0, int((orig_cy - box_hh) * sy))
-        bw = max(4, int(box_hw * 2 * sx))
-        bh = max(4, int(box_hh * 2 * sy))
-        bw = min(bw, vid_w - bx)
-        bh = min(bh, vid_h - by)
+        bw = max(4, min(int(box_hw * 2 * sx), vid_w - bx))
+        bh = max(4, min(int(box_hh * 2 * sy), vid_h - by))
 
-        # Search radius in video pixels (mirrors JS: SR_x=8, SR_y=35 in capture coords)
-        sr_x = max(4, int(8 * sx))
+        # Search radius  (matches JS: SR_x=8, SR_y=35 in capture space)
+        sr_x = max(4, int(8  * sx))
         sr_y = max(4, int(35 * sy))
 
-        # Seek to tap_time
-        start_frame = max(0, int(tap_time * fps))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        ret, first_frame = cap.read()
+        # ── Read first frame & build template ───────────────────────────────
+        start = max(0, int(tap_time * fps))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+        ret, f0 = cap.read()
         if not ret:
-            raise HTTPException(status_code=400, detail="Cannot read frame at tap_time")
+            raise HTTPException(status_code=400, detail="Cannot read first frame")
 
-        # Extract grayscale template from bounding box
-        first_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
-        template = first_gray[by:by + bh, bx:bx + bw].copy()
+        g0   = get_gray(f0)
+        tmpl = g0[by:by + bh, bx:bx + bw].copy()
 
-        def find_plate(gray_frame, pred_cx_cap, pred_cy_cap):
-            """Find plate using template matching. Args/returns in capture coord space."""
-            pvx = pred_cx_cap * sx
-            pvy = pred_cy_cap * sy
-
-            rx = max(0, int(pvx - box_hw * sx - sr_x))
-            ry = max(0, int(pvy - box_hh * sy - sr_y))
+        # ── Template-matching helper ─────────────────────────────────────────
+        def find_plate(gray, pcx, pcy):
+            pvx = pcx * sx
+            pvy = pcy * sy
+            rx  = max(0,     int(pvx - box_hw * sx - sr_x))
+            ry  = max(0,     int(pvy - box_hh * sy - sr_y))
             rx2 = min(vid_w, int(pvx + box_hw * sx + sr_x + bw))
             ry2 = min(vid_h, int(pvy + box_hh * sy + sr_y + bh))
+            region = gray[ry:ry2, rx:rx2]
+            if region.shape[0] < tmpl.shape[0] or region.shape[1] < tmpl.shape[1]:
+                return pcx, pcy
+            res = cv2.matchTemplate(region, tmpl, cv2.TM_SQDIFF)
+            _, _, (mx, my), _ = cv2.minMaxLoc(res)
+            return (rx + mx + bw / 2) / sx, (ry + my + bh / 2) / sy
 
-            region = gray_frame[ry:ry2, rx:rx2]
-            if region.shape[0] < template.shape[0] or region.shape[1] < template.shape[1]:
-                return pred_cx_cap, pred_cy_cap  # fallback to prediction
+        # ── Track every frame ────────────────────────────────────────────────
+        cx, cy = orig_cx, orig_cy
+        vx, vy = 0.0, 0.0
+        results = [{"t": start / fps, "x": cx + dot_off_x, "y": cy + dot_off_y}]
 
-            result = cv2.matchTemplate(region, template, cv2.TM_SQDIFF)
-            _, _, (mx, my), _ = cv2.minMaxLoc(result)
-
-            found_vx = rx + mx + bw / 2
-            found_vy = ry + my + bh / 2
-            return found_vx / sx, found_vy / sy
-
-        # Tracking state
-        cx = orig_cx
-        cy = orig_cy
-        vx = 0.0
-        vy = 0.0
-
-        results = [{"t": start_frame / fps, "x": cx + dot_offset_x, "y": cy + dot_offset_y}]
-
-        frame_num = start_frame + 1
-        while frame_num < total_frames:
+        fn = start + 1
+        while fn < total:
             ret, frame = cap.read()
             if not ret:
                 break
+            gray = get_gray(frame)
+            pcx, pcy = cx + vx, cy + vy
+            fcx, fcy = find_plate(gray, pcx, pcy)
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            pred_cx = cx + vx
-            pred_cy = cy + vy
-
-            found_cx, found_cy = find_plate(gray, pred_cx, pred_cy)
-
-            # Velocity EMA — same formula as JS: nv = found - pred + vel, cap at 25
-            nv_x = found_cx - pred_cx + vx
-            nv_y = found_cy - pred_cy + vy
-            mag = (nv_x ** 2 + nv_y ** 2) ** 0.5
+            nvx = fcx - pcx + vx
+            nvy = fcy - pcy + vy
+            mag = (nvx ** 2 + nvy ** 2) ** 0.5
             if mag > 25:
-                nv_x = nv_x * 25 / mag
-                nv_y = nv_y * 25 / mag
-
-            vx = vx * 0.2 + nv_x * 0.8
-            vy = vy * 0.2 + nv_y * 0.8
-            cx = found_cx
-            cy = found_cy
-
-            results.append({
-                "t": frame_num / fps,
-                "x": cx + dot_offset_x,
-                "y": cy + dot_offset_y
-            })
-            frame_num += 1
+                nvx, nvy = nvx * 25 / mag, nvy * 25 / mag
+            vx = vx * 0.2 + nvx * 0.8
+            vy = vy * 0.2 + nvy * 0.8
+            cx, cy = fcx, fcy
+            results.append({"t": fn / fps, "x": cx + dot_off_x, "y": cy + dot_off_y})
+            fn += 1
 
         cap.release()
         return {"frames": results, "cap_w": cap_w, "cap_h": cap_h}
 
     finally:
         try:
-            os.unlink(tmp_path)
+            os.unlink(tmp)
         except Exception:
             pass
