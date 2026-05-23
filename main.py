@@ -12,7 +12,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.0"}
+    return {"status": "ok", "version": "4.0"}
 
 
 @app.post("/analyze")
@@ -42,12 +42,12 @@ async def analyze(
         if not cap.isOpened():
             raise HTTPException(status_code=400, detail="Cannot open video")
 
-        fps   = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
+        fps   = max(1.0, float(cap.get(cv2.CAP_PROP_FPS)) or 30.0)
         raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # ── Rotation: iPhones store portrait with rotation metadata OpenCV ignores
+        # ── Rotation fix: iPhones store portrait with rotation metadata ──────
         cap_portrait = cap_h > cap_w
         vid_portrait = raw_h > raw_w
         rotation = None
@@ -65,17 +65,17 @@ async def analyze(
                 frm = cv2.rotate(frm, rotation)
             return frm
 
-        # ── Scale factors: capture-coords ↔ video-pixels ──
+        # ── Scale factors ────────────────────────────────────────────────────
         sx = vid_w / cap_w
         sy = vid_h / cap_h
 
-        # Bounding box in video pixels (plate region user drew)
+        # Bounding box in video pixels
         bx = max(0, int((orig_cx - box_hw) * sx))
         by = max(0, int((orig_cy - box_hh) * sy))
         bw = max(8, min(int(box_hw * 2 * sx), vid_w - bx))
         bh = max(8, min(int(box_hh * 2 * sy), vid_h - by))
 
-        # ── Seek to tap frame and read it ──
+        # ── Seek to tap frame ────────────────────────────────────────────────
         start = max(0, int(tap_time * fps))
         cap.set(cv2.CAP_PROP_POS_FRAMES, start)
         ret, frame0 = cap.read()
@@ -83,43 +83,48 @@ async def analyze(
             raise HTTPException(status_code=400, detail="Cannot read tap frame")
         frame0 = fix_frame(frame0)
 
-        # ── Use CSRT tracker (handles lighting/reflection changes robustly) ──
+        # ── CSRT tracker ─────────────────────────────────────────────────────
         try:
             tracker = cv2.TrackerCSRT_create()
         except AttributeError:
             tracker = cv2.TrackerKCF_create()
 
-        # Slightly expand bbox for better CSRT initialisation
-        pad  = max(4, int(min(bw, bh) * 0.15))
-        tbx  = max(0, bx - pad)
-        tby  = max(0, by - pad)
-        tbw  = min(vid_w - tbx, bw + 2 * pad)
-        tbh  = min(vid_h - tby, bh + 2 * pad)
+        pad = max(4, int(min(bw, bh) * 0.15))
+        tbx = max(0, bx - pad)
+        tby = max(0, by - pad)
+        tbw = min(vid_w - tbx, bw + 2 * pad)
+        tbh = min(vid_h - tby, bh + 2 * pad)
         tracker.init(frame0, (tbx, tby, tbw, tbh))
 
-        # Plate centre from initial bbox → capture coords
         px0 = (bx + bw / 2) / sx
         py0 = (by + bh / 2) / sy
-        results = [{"t": start / fps,
-                    "x": px0 + dot_off_x,
-                    "y": py0 + dot_off_y}]
+        results = [{"t": start / fps, "x": px0 + dot_off_x, "y": py0 + dot_off_y}]
 
         last_cx = bx + bw / 2
         last_cy = by + bh / 2
 
+        # ── Cap at 60 seconds to avoid timeout / OOM ─────────────────────────
+        max_frames = min(total - start - 1, int(fps * 60))
+
+        # For very long clips, skip frames to stay under ~600 processed frames
+        # (CSRT is ~50ms/frame → 600 frames ≈ 30 seconds processing)
+        step = max(1, int(max_frames / 600)) if max_frames > 600 else 1
+
         fn = start + 1
-        while fn < total:
+        processed = 0
+        while fn < start + 1 + max_frames:
             ret, frame = cap.read()
             if not ret:
                 break
-            frame = fix_frame(frame)
 
-            ok, bbox = tracker.update(frame)
-            if ok:
-                last_cx = bbox[0] + bbox[2] / 2
-                last_cy = bbox[1] + bbox[3] / 2
+            if (fn - start - 1) % step == 0:
+                frame = fix_frame(frame)
+                ok, bbox = tracker.update(frame)
+                if ok:
+                    last_cx = bbox[0] + bbox[2] / 2
+                    last_cy = bbox[1] + bbox[3] / 2
+                processed += 1
 
-            # Always emit a point (last known if tracking failed)
             results.append({
                 "t": fn / fps,
                 "x": last_cx / sx + dot_off_x,
