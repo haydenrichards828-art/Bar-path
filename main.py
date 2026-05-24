@@ -9,10 +9,13 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="ForceTrack Bar Path API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# Process at 25% resolution - 16x less memory than full 1080p, CSRT still accurate
+SCALE = 0.25
+
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "4.0"}
+    return {"status": "ok", "version": "5.0"}
 
 
 @app.post("/analyze")
@@ -47,7 +50,7 @@ async def analyze(
         raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # ── Rotation fix: iPhones store portrait with rotation metadata ──────
+        # ── Rotation fix for iPhone portrait videos ──────────────────────────
         cap_portrait = cap_h > cap_w
         vid_portrait = raw_h > raw_w
         rotation = None
@@ -60,76 +63,65 @@ async def analyze(
         else:
             vid_w, vid_h = raw_w, raw_h
 
-        def fix_frame(frm):
+        # Scaled processing dimensions
+        proc_w = max(8, int(vid_w * SCALE))
+        proc_h = max(8, int(vid_h * SCALE))
+
+        def get_proc_frame(frm):
             if rotation is not None:
                 frm = cv2.rotate(frm, rotation)
-            return frm
+            return cv2.resize(frm, (proc_w, proc_h))
 
-        # ── Scale factors ────────────────────────────────────────────────────
-        sx = vid_w / cap_w
-        sy = vid_h / cap_h
+        # Scale: capture-coords → scaled-video-pixels
+        sx = proc_w / cap_w
+        sy = proc_h / cap_h
 
-        # Bounding box in video pixels
+        # Bounding box in scaled video pixels
         bx = max(0, int((orig_cx - box_hw) * sx))
         by = max(0, int((orig_cy - box_hh) * sy))
-        bw = max(8, min(int(box_hw * 2 * sx), vid_w - bx))
-        bh = max(8, min(int(box_hh * 2 * sy), vid_h - by))
+        bw = max(4, min(int(box_hw * 2 * sx), proc_w - bx))
+        bh = max(4, min(int(box_hh * 2 * sy), proc_h - by))
 
-        # ── Seek to tap frame ────────────────────────────────────────────────
+        # Seek to tap frame
         start = max(0, int(tap_time * fps))
         cap.set(cv2.CAP_PROP_POS_FRAMES, start)
         ret, frame0 = cap.read()
         if not ret:
             raise HTTPException(status_code=400, detail="Cannot read tap frame")
-        frame0 = fix_frame(frame0)
 
-        # ── CSRT tracker ─────────────────────────────────────────────────────
+        frame0_proc = get_proc_frame(frame0)
+
+        # CSRT tracker on small frames - fast and memory-efficient
         try:
             tracker = cv2.TrackerCSRT_create()
         except AttributeError:
             tracker = cv2.TrackerKCF_create()
 
-        pad = max(4, int(min(bw, bh) * 0.15))
-        tbx = max(0, bx - pad)
-        tby = max(0, by - pad)
-        tbw = min(vid_w - tbx, bw + 2 * pad)
-        tbh = min(vid_h - tby, bh + 2 * pad)
-        tracker.init(frame0, (tbx, tby, tbw, tbh))
-
-        px0 = (bx + bw / 2) / sx
-        py0 = (by + bh / 2) / sy
-        results = [{"t": start / fps, "x": px0 + dot_off_x, "y": py0 + dot_off_y}]
+        pad = max(2, int(min(bw, bh) * 0.1))
+        tracker.init(frame0_proc, (
+            max(0, bx - pad),
+            max(0, by - pad),
+            min(proc_w - max(0, bx - pad), bw + 2 * pad),
+            min(proc_h - max(0, by - pad), bh + 2 * pad)
+        ))
 
         last_cx = bx + bw / 2
         last_cy = by + bh / 2
+        results = [{"t": start / fps, "x": last_cx / sx + dot_off_x, "y": last_cy / sy + dot_off_y}]
 
-        # ── Cap at 60 seconds to avoid timeout / OOM ─────────────────────────
-        max_frames = min(total - start - 1, int(fps * 60))
-
-        # For very long clips, skip frames to stay under ~600 processed frames
-        # (CSRT is ~50ms/frame → 600 frames ≈ 30 seconds processing)
-        step = max(1, int(max_frames / 600)) if max_frames > 600 else 1
+        # 45 second cap
+        max_frames = min(total - start - 1, int(fps * 45))
 
         fn = start + 1
-        processed = 0
         while fn < start + 1 + max_frames:
             ret, frame = cap.read()
             if not ret:
                 break
-
-            if (fn - start - 1) % step == 0:
-                frame = fix_frame(frame)
-                ok, bbox = tracker.update(frame)
-                if ok:
-                    last_cx = bbox[0] + bbox[2] / 2
-                    last_cy = bbox[1] + bbox[3] / 2
-                processed += 1
-
-            results.append({
-                "t": fn / fps,
-                "x": last_cx / sx + dot_off_x,
-                "y": last_cy / sy + dot_off_y
-            })
+            ok, bbox = tracker.update(get_proc_frame(frame))
+            if ok:
+                last_cx = bbox[0] + bbox[2] / 2
+                last_cy = bbox[1] + bbox[3] / 2
+            results.append({"t": fn / fps, "x": last_cx / sx + dot_off_x, "y": last_cy / sy + dot_off_y})
             fn += 1
 
         cap.release()
