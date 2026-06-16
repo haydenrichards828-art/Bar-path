@@ -17,33 +17,42 @@ def get_rotation(path):
     except: return 0
 
 def rotate_frame(frame, rot):
-    if rot == 90: return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if rot == 90:  return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
     if rot == 180: return cv2.rotate(frame, cv2.ROTATE_180)
     if rot == 270: return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     return frame
 
 class Kalman2D:
+    """
+    Zero-latency Kalman smoother.
+    Returns the CORRECTED state (current frame) not the prediction (next frame).
+    predict() is called before correct() so the state is advanced first,
+    then the measurement fuses in — giving filtered position with zero latency.
+    """
     def __init__(self):
         self.kf = cv2.KalmanFilter(4, 2)
-        self.kf.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
-        self.kf.transitionMatrix = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], np.float32)
-        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0
+        self.kf.measurementMatrix  = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
+        self.kf.transitionMatrix   = np.array([[1,0,1,0],[0,1,0,1],
+                                               [0,0,1,0],[0,0,0,1]], np.float32)
+        self.kf.processNoiseCov     = np.eye(4, dtype=np.float32) * 0.01
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 2.0
+        self.kf.errorCovPost        = np.eye(4, dtype=np.float32)
         self.init = False
     def update(self, x, y):
-        m = np.array([[x],[y]], np.float32)
         if not self.init:
-            self.kf.statePre = np.array([[x],[y],[0],[0]], np.float32)
+            self.kf.statePost = np.array([[x],[y],[0],[0]], np.float32)
             self.init = True
-        self.kf.correct(m)
-        p = self.kf.predict()
-        return float(p[0]), float(p[1])
-    def predict(self):
+        else:
+            self.kf.predict()
+        m = np.array([[x],[y]], np.float32)
+        corrected = self.kf.correct(m)
+        return float(corrected[0]), float(corrected[1])
+    def predict_only(self):
         p = self.kf.predict()
         return float(p[0]), float(p[1])
 
 def hough_detect(gray, min_r, max_r, search_box=None):
-    """Detect largest circle via Hough. search_box=(x,y,w,h) restricts ROI."""
+    """Detect largest circle via Hough, optionally within search_box (x,y,w,h)."""
     if search_box is not None:
         sx, sy, sw, sh = [int(v) for v in search_box]
         h, w = gray.shape
@@ -55,27 +64,34 @@ def hough_detect(gray, min_r, max_r, search_box=None):
     else:
         roi, ox, oy = gray, 0, 0
     b = cv2.GaussianBlur(roi, (9,9), 2)
-    for p2 in [28, 22, 16, 12]:
-        c = cv2.HoughCircles(b, cv2.HOUGH_GRADIENT, 1.2, 30,
+    for p2 in [30, 24, 18, 12]:
+        c = cv2.HoughCircles(b, cv2.HOUGH_GRADIENT, 1.2, 40,
                              param1=80, param2=p2, minRadius=min_r, maxRadius=max_r)
         if c is not None:
             best = max(c[0], key=lambda x: x[2])
             return float(best[0]+ox), float(best[1]+oy), float(best[2])
     return None
 
-def circle_in_region(gray, bbox, min_r, max_r):
-    """Return True if a Hough circle exists inside the bounding box."""
-    x, y, w, h = [int(v) for v in bbox]
-    gh, gw = gray.shape
-    x, y = max(0, x), max(0, y)
-    ex, ey = min(gw, x+w), min(gh, y+h)
-    if ex <= x or ey <= y: return False
-    roi = gray[y:ey, x:ex]
-    if roi.size == 0: return False
-    b = cv2.GaussianBlur(roi, (7,7), 2)
-    c = cv2.HoughCircles(b, cv2.HOUGH_GRADIENT, 1.2, 20,
-                         param1=70, param2=10, minRadius=min_r, maxRadius=max_r)
-    return c is not None
+def template_match(gray, tmpl, last_cx, last_cy, search_half, threshold=0.35):
+    """
+    Template matching near last known position.
+    Returns (cx, cy) if confident match found, else None.
+    """
+    th, tw = tmpl.shape[:2]
+    sx = max(0, int(last_cx - search_half))
+    sy = max(0, int(last_cy - search_half))
+    ex = min(gray.shape[1], int(last_cx + search_half))
+    ey = min(gray.shape[0], int(last_cy + search_half))
+    if (ex - sx) < tw or (ey - sy) < th:
+        return None
+    roi = gray[sy:ey, sx:ex]
+    res = cv2.matchTemplate(roi, tmpl, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+    if max_val < threshold:
+        return None
+    cx = sx + max_loc[0] + tw // 2
+    cy = sy + max_loc[1] + th // 2
+    return float(cx), float(cy)
 
 def clamp_bbox(bbox, wp, hp):
     x, y, w, h = bbox
@@ -89,8 +105,8 @@ def bbox_from_center(cx, cy, r, scale=1.6):
     return (cx-half, cy-half, half*2, half*2)
 
 def make_tracker():
-    try: return cv2.TrackerCSRT_create()
-    except AttributeError: return cv2.TrackerKCF_create()
+    try:    return cv2.TrackerCSRT_create()
+    except: return cv2.TrackerKCF_create()
 
 @app.get("/health")
 def health(): return {"status":"ok","version":"0.4.0"}
@@ -103,54 +119,58 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
     try:
         data = await video.read()
         if len(data) > 600*1024*1024:
-            raise HTTPException(400, "Video too large")
+            raise HTTPException(400, "Video too large (max 600MB)")
         with open(tmp,"wb") as f: f.write(data)
         del data
 
         rot = get_rotation(tmp)
         cap = cv2.VideoCapture(tmp)
         if not cap.isOpened(): raise HTTPException(400, "Cannot open video")
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # Frame 0: detect initial plate
+        # ── Frame 0: detect initial plate ──────────────────────────────────
         ret, f0 = cap.read()
         if not ret: raise HTTPException(400, "Cannot read first frame")
         f0 = rotate_frame(f0, rot)
         raw_h, raw_w = f0.shape[:2]
 
-        scale = 0.5
-        wp, hp = int(raw_w*scale), int(raw_h*scale)
+        # 75% scale — substantially better CSRT texture vs 50%
+        scale = 0.75
+        wp, hp = int(raw_w * scale), int(raw_h * scale)
         f0s = cv2.resize(f0, (wp, hp))
         g0  = cv2.cvtColor(f0s, cv2.COLOR_BGR2GRAY)
         del f0
 
-        min_r = max(8,  int(hp * 0.06))
+        min_r = max(8,    int(hp * 0.06))
         max_r = min(wp//2, int(hp * 0.45))
 
         det = hough_detect(g0, min_r, max_r)
-        if det is None: det = (wp/2, hp/2, min_r*2)
+        if det is None:
+            det = (wp/2, hp/2, min_r*2)
         cx0, cy0, r0 = det
         plate_r = r0
 
-        # Verification radii (looser bounds for in-loop checks)
-        vmin_r = int(plate_r * 0.5)
-        vmax_r = int(plate_r * 1.5)
+        # ── Save plate template for template-matching fallback ─────────────
+        pad      = int(plate_r * 1.8)
+        tx1, ty1 = max(0, int(cx0-pad)), max(0, int(cy0-pad))
+        tx2, ty2 = min(wp, int(cx0+pad)), min(hp, int(cy0+pad))
+        plate_tmpl = g0[ty1:ty2, tx1:tx2].copy()
 
+        # ── Initialise CSRT on frame 0 ─────────────────────────────────────
         bbox0 = clamp_bbox(bbox_from_center(cx0, cy0, r0, 1.6), wp, hp)
         tracker = make_tracker()
         tracker.init(f0s, bbox0)
         del f0s
 
-        kal = Kalman2D()
-        results = []
+        kal          = Kalman2D()
+        results      = []
         last_cx, last_cy = cx0, cy0
-        # Plausibility gate: allow up to 10x plate radius jump between ANY two frames
-        # (with every-frame processing the per-frame velocity is ~1-3 plate-radii max)
-        max_jump_sq  = (plate_r * 10) ** 2
-        reinit_half  = int(plate_r * 8)   # large local search window
+        max_jump_sq  = (plate_r * 2.5) ** 2   # tight gate: 2.5x plate radius
+        reinit_half  = int(plate_r * 6)        # Hough search window
+        tmpl_half    = int(plate_r * 8)        # template match search window
 
-        # Process EVERY frame — accuracy over speed
+        # ── Process EVERY frame — no skipping, perfect temporal accuracy ───
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
         while True:
@@ -162,71 +182,68 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             t     = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
             del frame
 
-            ok, bbox = tracker.update(small)
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            ok, bbox = tracker.update(small)
 
-            def reinit_window():
-                """Hough in enlarged window around last known pos. Returns (kx,ky) or None."""
+            def try_recover(gray_f, color_f):
                 nonlocal tracker, last_cx, last_cy
-                sb = (last_cx - reinit_half, last_cy - reinit_half,
-                      reinit_half * 2, reinit_half * 2)
-                rd = hough_detect(gray, vmin_r, vmax_r, sb)
+
+                # Strategy 1 — Hough near last position (shape-based)
+                sb = (last_cx-reinit_half, last_cy-reinit_half,
+                      reinit_half*2, reinit_half*2)
+                rd = hough_detect(gray_f, int(plate_r*0.6), int(plate_r*1.5), sb)
                 if rd:
                     rx, ry, _ = rd
                     nb = clamp_bbox(bbox_from_center(rx, ry, plate_r, 1.6), wp, hp)
                     tracker = make_tracker()
-                    tracker.init(small, nb)
+                    tracker.init(color_f, nb)
                     kx2, ky2 = kal.update(rx, ry)
                     last_cx, last_cy = rx, ry
                     return kx2, ky2
-                return None
 
-            def reinit_global():
-                """Full-frame Hough search — last resort."""
-                nonlocal tracker, last_cx, last_cy
-                rd = hough_detect(gray, vmin_r, vmax_r)
-                if rd:
-                    rx, ry, _ = rd
+                # Strategy 2 — Template matching (appearance-based, anchored to original plate)
+                tm = template_match(gray_f, plate_tmpl, last_cx, last_cy, tmpl_half)
+                if tm:
+                    rx, ry = tm
                     nb = clamp_bbox(bbox_from_center(rx, ry, plate_r, 1.6), wp, hp)
                     tracker = make_tracker()
-                    tracker.init(small, nb)
+                    tracker.init(color_f, nb)
                     kx2, ky2 = kal.update(rx, ry)
                     last_cx, last_cy = rx, ry
                     return kx2, ky2
+
+                # Strategy 3 — Full-frame Hough (last resort, constrained by proximity)
+                rd2 = hough_detect(gray_f, int(plate_r*0.6), int(plate_r*1.5))
+                if rd2:
+                    rx, ry, _ = rd2
+                    if (rx-last_cx)**2 + (ry-last_cy)**2 < (plate_r*10)**2:
+                        nb = clamp_bbox(bbox_from_center(rx, ry, plate_r, 1.6), wp, hp)
+                        tracker = make_tracker()
+                        tracker.init(color_f, nb)
+                        kx2, ky2 = kal.update(rx, ry)
+                        last_cx, last_cy = rx, ry
+                        return kx2, ky2
+
                 return None
 
             if ok:
                 cx = bbox[0] + bbox[2] / 2
                 cy = bbox[1] + bbox[3] / 2
-                jump_sq = (cx - last_cx) ** 2 + (cy - last_cy) ** 2
-
-                if jump_sq > max_jump_sq:
-                    # CSRT jumped to a distant object — search near last known pos
-                    res = reinit_window() or reinit_global()
-                    kx, ky = res if res else kal.predict()
+                if (cx-last_cx)**2 + (cy-last_cy)**2 > max_jump_sq:
+                    res = try_recover(gray, small)
+                    kx, ky = res if res else kal.predict_only()
                 else:
-                    # CSRT stayed nearby — verify a barbell circle is actually inside its bbox
-                    if circle_in_region(gray, bbox, vmin_r, vmax_r):
-                        kx, ky = kal.update(cx, cy)
-                        last_cx, last_cy = cx, cy
-                    else:
-                        # Tracker drifted to a non-circular object (rack, etc.)
-                        res = reinit_window() or reinit_global()
-                        kx, ky = res if res else kal.update(cx, cy)
+                    kx, ky = kal.update(cx, cy)
+                    last_cx, last_cy = cx, cy
             else:
-                # CSRT completely lost — try to recover
-                res = reinit_window() or reinit_global()
-                kx, ky = res if res else kal.predict()
+                res = try_recover(gray, small)
+                kx, ky = res if res else kal.predict_only()
 
             del small
-
-            results.append({"t": round(t, 4),
-                            "x": round(kx / wp, 5),
-                            "y": round(ky / hp, 5)})
+            results.append({"t": round(t,4), "x": round(kx/wp,5), "y": round(ky/hp,5)})
 
         cap.release()
-        return {"frames": results, "cap_w": raw_w, "cap_h": raw_h,
-                "fps": fps, "rotation": rot}
+        return {"frames": results, "cap_w": raw_w, "cap_h": raw_h, "fps": fps, "rotation": rot}
     finally:
         try: os.unlink(tmp)
         except: pass
