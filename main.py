@@ -1,8 +1,9 @@
 import os, cv2, numpy as np, tempfile, subprocess, json
+from collections import deque
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="ForceTrack Bar Path API", version="0.8.1")
+app = FastAPI(title="ForceTrack Bar Path API", version="0.8.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 VALID_KEY = os.environ.get("BARPATH_API_KEY", "")
 
@@ -29,8 +30,6 @@ def make_csrt():
         params.use_channel_weights = True
         params.filter_lr           = 0.01
         params.padding             = 3.5
-        params.histogram_lr        = 0.02
-        params.num_hog_channels_used = 18
         return cv2.TrackerCSRT_create(params)
     except Exception:
         try:    return cv2.TrackerCSRT_create()
@@ -86,6 +85,22 @@ def lk_bidirectional(prev_gray,curr_gray,pts):
     if len(good_new)<4: return None,None,None
     return float(np.median(good_new[:,0])),float(np.median(good_new[:,1])),good_new.reshape(-1,1,2)
 
+def phase_corr_refine(prev_gray,curr_gray,prev_cx,prev_cy,lk_cx,lk_cy,plate_r):
+    half=int(plate_r*1.2)
+    py1=max(0,int(prev_cy-half)); py2=min(prev_gray.shape[0],int(prev_cy+half))
+    px1=max(0,int(prev_cx-half)); px2=min(prev_gray.shape[1],int(prev_cx+half))
+    cy1=max(0,int(lk_cy-half));  cy2=min(curr_gray.shape[0],int(lk_cy+half))
+    cx1=max(0,int(lk_cx-half));  cx2=min(curr_gray.shape[1],int(lk_cx+half))
+    h=min(py2-py1,cy2-cy1); w=min(px2-px1,cx2-cx1)
+    if h<32 or w<32: return lk_cx,lk_cy
+    win=cv2.createHanningWindow((w,h),cv2.CV_32F)
+    prev_f=np.float32(prev_gray[py1:py1+h,px1:px1+w])*win
+    curr_f=np.float32(curr_gray[cy1:cy1+h,cx1:cx1+w])*win
+    shift,response=cv2.phaseCorrelate(prev_f,curr_f)
+    if response>0.15 and abs(shift[0])<plate_r*0.4 and abs(shift[1])<plate_r*0.4:
+        return lk_cx+shift[0],lk_cy+shift[1]
+    return lk_cx,lk_cy
+
 def seed_lk(gray,cx,cy,plate_r):
     m=np.zeros_like(gray,dtype=np.uint8)
     cv2.ellipse(m,(int(cx),int(cy)),(int(plate_r),int(plate_r)),0,0,360,255,-1)
@@ -101,7 +116,7 @@ def bbox_from_center(cx,cy,r,scale=1.6):
     half=r*scale; return (cx-half,cy-half,half*2,half*2)
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.8.1"}
+def health(): return {"status":"ok","version":"0.8.2"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -160,8 +175,10 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
 
         results=[]; last_cx,last_cy=cx0,cy0; prev_gray=g0.copy()
         consecutive_bad=0
-        max_jump_sq=(plate_r*2.0)**2
+        normal_gate_sq    = (plate_r * 1.5) ** 2
+        immediate_gate_sq = (plate_r * 4.0) ** 2
         reinit_half=int(plate_r*6); tmpl_half=int(plate_r*8)
+        vel_history=deque(maxlen=5)
 
         cap.set(cv2.CAP_PROP_POS_FRAMES,0)
         frame_idx=0
@@ -204,12 +221,19 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                         return cx2,cy2
                 return None,None
 
+            def pred_cx_cy():
+                if len(vel_history)<3: return last_cx,last_cy
+                return last_cx+float(np.median([v[0] for v in vel_history])),                       last_cy+float(np.median([v[1] for v in vel_history]))
+
             def try_recover():
-                sb=(last_cx-reinit_half,last_cy-reinit_half,reinit_half*2,reinit_half*2)
-                rd=hough_detect(gray,int(plate_r*0.6),int(plate_r*1.5),sb)
-                if rd: return _reinit(rd[0],rd[1])
-                tm=template_match(gray,plate_tmpl,last_cx,last_cy,tmpl_half)
-                if tm: return _reinit(tm[0],tm[1])
+                pcx,pcy=pred_cx_cy()
+                for sx,sy in [(pcx,pcy),(last_cx,last_cy)]:
+                    sb=(sx-reinit_half,sy-reinit_half,reinit_half*2,reinit_half*2)
+                    rd=hough_detect(gray,int(plate_r*0.6),int(plate_r*1.5),sb)
+                    if rd: return _reinit(rd[0],rd[1])
+                for sx,sy in [(pcx,pcy),(last_cx,last_cy)]:
+                    tm=template_match(gray,plate_tmpl,sx,sy,tmpl_half)
+                    if tm: return _reinit(tm[0],tm[1])
                 cx2,cy2=run_csrt()
                 if cx2 is not None: return _reinit(cx2,cy2)
                 rd2=hough_detect(gray,int(plate_r*0.6),int(plate_r*1.5))
@@ -221,7 +245,10 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
 
             if lk_cx is not None:
                 lk_jump=(lk_cx-last_cx)**2+(lk_cy-last_cy)**2
-                if lk_jump>max_jump_sq:
+                if lk_jump>immediate_gate_sq:
+                    res=try_recover(); cx,cy=res if res else (last_cx,last_cy)
+                    vel_history.clear()
+                elif lk_jump>normal_gate_sq:
                     consecutive_bad+=1
                     if consecutive_bad>=2:
                         res=try_recover(); cx,cy=res if res else (last_cx,last_cy)
@@ -229,8 +256,9 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                         cx,cy=last_cx,last_cy
                 else:
                     consecutive_bad=0
-                    cx,cy=lk_cx,lk_cy
-                    last_cx,last_cy=lk_cx,lk_cy
+                    cx,cy=phase_corr_refine(prev_gray,gray,last_cx,last_cy,lk_cx,lk_cy,plate_r)
+                    vel_history.append((cx-last_cx,cy-last_cy))
+                    last_cx,last_cy=cx,cy
                     csrt_stale=True
             else:
                 consecutive_bad+=1
