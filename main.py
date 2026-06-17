@@ -3,7 +3,7 @@ from collections import deque
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="ForceTrack Bar Path API", version="0.9.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="0.9.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 VALID_KEY = os.environ.get("BARPATH_API_KEY", "")
 
@@ -37,10 +37,11 @@ def make_csrt():
 
 LK_PARAMS = dict(winSize=(31,31), maxLevel=4,
                  criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT,30,0.01))
-GF_PARAMS    = dict(maxCorners=100, qualityLevel=0.01, minDistance=3, blockSize=7)
-LK_REFRESH   = 15
-TMPL_REFRESH = 60
-FB_THRESHOLD = 1.5
+GF_PARAMS      = dict(maxCorners=100, qualityLevel=0.01, minDistance=3, blockSize=7)
+LK_REFRESH     = 15
+TMPL_REFRESH   = 60
+HOUGH_VERIFY   = 10   # Re-anchor to circle every 10 frames during normal tracking
+FB_THRESHOLD   = 1.5
 
 def hough_detect(gray, min_r, max_r, search_box=None, extra_sensitive=False):
     if search_box is not None:
@@ -117,7 +118,7 @@ def bbox_from_center(cx, cy, r, scale=1.6):
     half = r*scale; return (cx-half, cy-half, half*2, half*2)
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.9.0"}
+def health(): return {"status":"ok","version":"0.9.1"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -184,10 +185,16 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
         tmpl_half   = int(plate_r * 8)
         vel_history = deque(maxlen=5)
 
+        # Tighter Hough radius range for in-tracking verification
+        # (less likely to snap to wrong circle vs wide recovery range)
+        hough_verify_min_r = int(plate_r * 0.75)
+        hough_verify_max_r = int(plate_r * 1.25)
+
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        frame_idx_counter = 0
 
         while True:
-            # FIX: actual container PTS — matches video.currentTime exactly
+            # Actual container PTS — matches video.currentTime in browser exactly
             t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
             ret, frame = cap.read()
@@ -195,13 +202,13 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
 
             frame = rotate_frame(frame, rot)
             gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame_idx_counter += 1
 
-            frame_approx_idx = int(round(t * fps))
-            if frame_approx_idx > 0 and frame_approx_idx % LK_REFRESH == 0:
+            if frame_idx_counter % LK_REFRESH == 0:
                 fresh = seed_lk(gray, last_cx, last_cy, plate_r)
                 if fresh is not None and len(fresh) >= 4:
                     lk_pts = fresh
-            if frame_approx_idx > 0 and frame_approx_idx % TMPL_REFRESH == 0:
+            if frame_idx_counter % TMPL_REFRESH == 0:
                 plate_tmpl = make_tmpl(gray, last_cx, last_cy)
 
             lk_cx, lk_cy, lk_pts_new = lk_bidirectional(prev_gray, gray, lk_pts)
@@ -255,7 +262,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                         return _reinit(rx, ry)
                 return None
 
-            # FIX: zero-delay — no hold frame, immediate recovery on every bad frame
+            # Zero-delay decision — no hold frames ever
             if lk_cx is not None:
                 lk_jump = (lk_cx-last_cx)**2 + (lk_cy-last_cy)**2
                 if lk_jump > immediate_gate_sq:
@@ -263,16 +270,34 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                     cx, cy = res if res else pred_cx_cy()
                     vel_history.clear()
                 elif lk_jump > normal_gate_sq:
-                    # IMMEDIATE recovery — gate triggers at 10+ m/s, always a tracking error
                     res = try_recover()
                     if res:
                         cx, cy = res
                         vel_history.clear()
                     else:
-                        cx, cy = pred_cx_cy()  # velocity prediction, not frozen
+                        cx, cy = pred_cx_cy()
                 else:
                     cx, cy = phase_corr_refine(prev_gray, gray, last_cx, last_cy,
                                                lk_cx, lk_cy, plate_r)
+
+                    # ── ECCENTRIC-PHASE FIX: periodic Hough re-anchor ─────────
+                    # During fast eccentric descent, LK features can drift due to
+                    # motion blur — the dot gradually lags behind the plate.
+                    # Every HOUGH_VERIFY frames, run Hough on a tight box around
+                    # our current position. If it finds the actual circle and it's
+                    # close (within 2× plate_r), SNAP to the true circle center.
+                    # This corrects any LK drift every ~0.33 seconds at 30fps.
+                    if frame_idx_counter % HOUGH_VERIFY == 0:
+                        sb = (cx-reinit_half, cy-reinit_half, reinit_half*2, reinit_half*2)
+                        hv = hough_detect(gray, hough_verify_min_r, hough_verify_max_r, sb)
+                        if hv:
+                            hx, hy, _ = hv
+                            snap_dist_sq = (hx-cx)**2 + (hy-cy)**2
+                            if snap_dist_sq < (plate_r * 2.0) ** 2:
+                                # Hough found the plate nearby — snap to true circle center
+                                cx, cy = hx, hy
+                    # ─────────────────────────────────────────────────────────
+
                     vel_history.append((cx-last_cx, cy-last_cy))
                     last_cx, last_cy = cx, cy
                     csrt_stale = True
