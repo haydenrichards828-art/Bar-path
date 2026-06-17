@@ -1,18 +1,15 @@
-import os, cv2, numpy as np, tempfile, subprocess, json
-from collections import deque
+import os, cv2, numpy as np, tempfile, subprocess, json, asyncio
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="0.9.1")
+app = FastAPI(title="ForceTrack Bar Path API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 VALID_KEY = os.environ.get("BARPATH_API_KEY", "")
 
 def get_rotation(path):
     try:
-        r = subprocess.run(["ffprobe","-v","error","-select_streams","v:0",
-            "-show_entries","stream_tags=rotate","-of",
-            "default=noprint_wrappers=1:nokey=1",path],
-            capture_output=True, text=True, timeout=10)
+        r = subprocess.run(["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream_tags=rotate","-of","default=noprint_wrappers=1:nokey=1",path], capture_output=True, text=True, timeout=10)
         v = r.stdout.strip()
         return int(v) if v else 0
     except: return 0
@@ -23,301 +20,160 @@ def rotate_frame(frame, rot):
     if rot == 270: return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     return frame
 
-def make_csrt():
-    try:
-        params = cv2.TrackerCSRT_Params()
-        params.use_segmentation    = True
-        params.use_channel_weights = True
-        params.filter_lr           = 0.01
-        params.padding             = 3.5
-        return cv2.TrackerCSRT_create(params)
-    except Exception:
-        try:    return cv2.TrackerCSRT_create()
-        except: return cv2.TrackerKCF_create()
+class Kalman2D:
+    def __init__(self):
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
+        self.kf.transitionMatrix = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], np.float32)
+        self.kf.processNoiseCov  = np.eye(4, dtype=np.float32) * 0.03
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0
+        self.init = False
+    def update(self, x, y):
+        m = np.array([[x],[y]], np.float32)
+        if not self.init:
+            self.kf.statePre = np.array([[x],[y],[0],[0]], np.float32)
+            self.init = True
+        self.kf.correct(m)
+        p = self.kf.predict()
+        return float(p[0]), float(p[1])
+    def predict(self):
+        p = self.kf.predict(); return float(p[0]), float(p[1])
 
-LK_PARAMS = dict(winSize=(31,31), maxLevel=4,
-                 criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT,30,0.01))
-GF_PARAMS      = dict(maxCorners=100, qualityLevel=0.01, minDistance=3, blockSize=7)
-LK_REFRESH     = 15
-TMPL_REFRESH   = 60
-HOUGH_VERIFY   = 10   # Re-anchor to circle every 10 frames during normal tracking
-FB_THRESHOLD   = 1.5
-
-def hough_detect(gray, min_r, max_r, search_box=None, extra_sensitive=False):
+def hough_detect(gray, min_r, max_r, search_box=None):
     if search_box is not None:
-        sx,sy,sw,sh = [int(v) for v in search_box]
-        h,w = gray.shape
-        sx,sy = max(0,sx), max(0,sy)
-        ex,ey = min(w,sx+sw), min(h,sy+sh)
-        if ex<=sx or ey<=sy: return None
-        roi = gray[sy:ey, sx:ex]; ox, oy = sx, sy
+        sx, sy, sw, sh = [int(v) for v in search_box]
+        h, w = gray.shape
+        sx, sy = max(0, sx), max(0, sy)
+        ex, ey = min(w, sx+sw), min(h, sy+sh)
+        if ex <= sx or ey <= sy: return None
+        roi, ox, oy = gray[sy:ey, sx:ex], sx, sy
     else:
         roi, ox, oy = gray, 0, 0
     b = cv2.GaussianBlur(roi, (9,9), 2)
-    p2_values = [30, 24, 18, 12, 8, 5] if extra_sensitive else [30, 24, 18, 12]
-    for p2 in p2_values:
-        c = cv2.HoughCircles(b, cv2.HOUGH_GRADIENT, 1.2, 40,
-                             param1=80, param2=p2, minRadius=min_r, maxRadius=max_r)
+    for p2 in [28, 22, 16, 10]:
+        c = cv2.HoughCircles(b, cv2.HOUGH_GRADIENT, 1.2, 40, param1=80, param2=p2, minRadius=min_r, maxRadius=max_r)
         if c is not None:
             best = max(c[0], key=lambda x: x[2])
             return float(best[0]+ox), float(best[1]+oy), float(best[2])
     return None
 
-def template_match(gray, tmpl, cx, cy, search_half, threshold=0.35):
-    th, tw = tmpl.shape[:2]
-    sx = max(0, int(cx-search_half)); sy = max(0, int(cy-search_half))
-    ex = min(gray.shape[1], int(cx+search_half))
-    ey = min(gray.shape[0], int(cy+search_half))
-    if (ex-sx) < tw or (ey-sy) < th: return None
-    roi = gray[sy:ey, sx:ex]
-    res = cv2.matchTemplate(roi, tmpl, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, max_loc = cv2.minMaxLoc(res)
-    if max_val < threshold: return None
-    return float(sx+max_loc[0]+tw//2), float(sy+max_loc[1]+th//2)
-
-def lk_bidirectional(prev_gray, curr_gray, pts):
-    if pts is None or len(pts) < 4: return None, None, None
-    new_pts, sf, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, pts, None, **LK_PARAMS)
-    if new_pts is None: return None, None, None
-    back_pts, sb, _ = cv2.calcOpticalFlowPyrLK(curr_gray, prev_gray, new_pts, None, **LK_PARAMS)
-    if back_pts is None: return None, None, None
-    fb_err = np.sqrt(((pts-back_pts)**2).sum(axis=2)).ravel()
-    good = (sf.ravel()==1) & (sb.ravel()==1) & (fb_err < FB_THRESHOLD)
-    good_new = new_pts[good]
-    if len(good_new) < 4: return None, None, None
-    return float(np.median(good_new[:,0])), float(np.median(good_new[:,1])), good_new.reshape(-1,1,2)
-
-def phase_corr_refine(prev_gray, curr_gray, prev_cx, prev_cy, lk_cx, lk_cy, plate_r):
-    half = int(plate_r * 1.2)
-    py1 = max(0, int(prev_cy-half)); py2 = min(prev_gray.shape[0], int(prev_cy+half))
-    px1 = max(0, int(prev_cx-half)); px2 = min(prev_gray.shape[1], int(prev_cx+half))
-    cy1 = max(0, int(lk_cy-half));  cy2 = min(curr_gray.shape[0], int(lk_cy+half))
-    cx1 = max(0, int(lk_cx-half));  cx2 = min(curr_gray.shape[1], int(lk_cx+half))
-    h = min(py2-py1, cy2-cy1); w = min(px2-px1, cx2-cx1)
-    if h < 32 or w < 32: return lk_cx, lk_cy
-    win = cv2.createHanningWindow((w,h), cv2.CV_32F)
-    prev_f = np.float32(prev_gray[py1:py1+h, px1:px1+w]) * win
-    curr_f = np.float32(curr_gray[cy1:cy1+h, cx1:cx1+w]) * win
-    shift, response = cv2.phaseCorrelate(prev_f, curr_f)
-    if response > 0.15 and abs(shift[0]) < plate_r*0.4 and abs(shift[1]) < plate_r*0.4:
-        return lk_cx+shift[0], lk_cy+shift[1]
-    return lk_cx, lk_cy
-
-def seed_lk(gray, cx, cy, plate_r):
-    m = np.zeros_like(gray, dtype=np.uint8)
-    cv2.ellipse(m, (int(cx), int(cy)), (int(plate_r), int(plate_r)), 0, 0, 360, 255, -1)
-    return cv2.goodFeaturesToTrack(gray, mask=m, **GF_PARAMS)
-
 def clamp_bbox(bbox, wp, hp):
-    x,y,w,h = bbox
-    x,y = max(0,int(x)), max(0,int(y))
-    w = min(wp-x, int(w)); h = min(hp-y, int(h))
+    x, y, w, h = bbox
+    x, y = max(0, int(x)), max(0, int(y))
+    w, h = min(wp-x, int(w)), min(hp-y, int(h))
     return (x, y, max(1,w), max(1,h))
 
 def bbox_from_center(cx, cy, r, scale=1.6):
-    half = r*scale; return (cx-half, cy-half, half*2, half*2)
+    half = r * scale
+    return (cx-half, cy-half, half*2, half*2)
+
+def make_tracker():
+    try:    return cv2.TrackerCSRT_create()
+    except: return cv2.TrackerKCF_create()
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.9.1"}
+def health(): return {"status": "ok", "version": "1.0.0"}
 
 @app.post("/analyze")
-async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
+async def analyze(video: UploadFile = File(...), params: str = Form("{}"), api_key: str = Form("")):
     if VALID_KEY and api_key != VALID_KEY:
         raise HTTPException(401, "Invalid API key")
-    p = {}
-    try: p = json.loads(params)
-    except: pass
     tmp = tempfile.mktemp(suffix=".mp4")
     try:
         data = await video.read()
-        if len(data) > 600*1024*1024:
-            raise HTTPException(400, "Video too large (max 600MB)")
+        if len(data) > 600 * 1024 * 1024:
+            raise HTTPException(400, "Video too large")
         with open(tmp, "wb") as f: f.write(data)
         del data
+    except HTTPException: raise
+    except Exception as e:
+        raise HTTPException(500, f"Could not save video: {e}")
 
-        rot = get_rotation(tmp)
-        cap = cv2.VideoCapture(tmp)
-        if not cap.isOpened(): raise HTTPException(400, "Cannot open video")
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-
-        ret, f0 = cap.read()
-        if not ret: raise HTTPException(400, "Cannot read first frame")
-        f0 = rotate_frame(f0, rot)
-        raw_h, raw_w = f0.shape[:2]
-        wp, hp = raw_w, raw_h
-        f0s = f0.copy()
-        g0  = cv2.cvtColor(f0s, cv2.COLOR_BGR2GRAY)
-        del f0
-
-        min_r = max(8, int(hp*0.05))
-        max_r = min(wp//2, int(hp*0.45))
-
-        if 'start_x' in p and 'start_y' in p:
-            cx0 = float(p['start_x']) * wp
-            cy0 = float(p['start_y']) * hp
-            sr  = int(min(wp,hp)*0.15)
-            det = hough_detect(g0, min_r, max_r, (cx0-sr, cy0-sr, sr*2, sr*2))
-            r0  = det[2] if det else int(min(wp,hp)*0.06)
-        else:
-            det = hough_detect(g0, min_r, max_r)
-            if det is None: det = (wp/2, hp/2, min_r*2)
+    async def stream():
+        try:
+            rot = get_rotation(tmp)
+            cap = cv2.VideoCapture(tmp)
+            if not cap.isOpened():
+                yield json.dumps({"error": "Cannot open video"}) + "\n"; return
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            ret, f0 = cap.read()
+            if not ret:
+                yield json.dumps({"error": "Cannot read first frame"}) + "\n"; return
+            f0 = rotate_frame(f0, rot)
+            raw_h, raw_w = f0.shape[:2]
+            wp, hp = int(raw_w*0.5), int(raw_h*0.5)
+            f0s = cv2.resize(f0, (wp, hp))
+            g0 = cv2.cvtColor(f0s, cv2.COLOR_BGR2GRAY)
+            del f0
+            try: p = json.loads(params)
+            except: p = {}
+            hint_x = float(p.get("start_x", 0.5)) * wp
+            hint_y = float(p.get("start_y", 0.5)) * hp
+            min_r = max(8, int(hp*0.06))
+            max_r = min(wp//2, int(hp*0.46))
+            pad = int(min(wp,hp)*0.3)
+            det = hough_detect(g0, min_r, max_r, (hint_x-pad, hint_y-pad, pad*2, pad*2)) or hough_detect(g0, min_r, max_r)
+            if det is None: det = (hint_x, hint_y, max(min_r*2, int(hp*0.08)))
             cx0, cy0, r0 = det
-        plate_r = r0
-
-        def make_tmpl(gray, cx, cy):
-            pad = int(plate_r * 1.8)
-            return gray[max(0,int(cy-pad)):min(hp,int(cy+pad)),
-                        max(0,int(cx-pad)):min(wp,int(cx+pad))].copy()
-
-        plate_tmpl = make_tmpl(g0, cx0, cy0)
-        lk_pts     = seed_lk(g0, cx0, cy0, plate_r)
-        tracker    = make_csrt()
-        tracker.init(f0s, clamp_bbox(bbox_from_center(cx0, cy0, r0, 1.6), wp, hp))
-        del f0s
-        csrt_stale = False
-
-        results  = []
-        last_cx, last_cy = cx0, cy0
-        prev_gray = g0.copy()
-        normal_gate_sq    = (plate_r * 1.5) ** 2
-        immediate_gate_sq = (plate_r * 4.0) ** 2
-        reinit_half = int(plate_r * 6)
-        tmpl_half   = int(plate_r * 8)
-        vel_history = deque(maxlen=5)
-
-        # Tighter Hough radius range for in-tracking verification
-        # (less likely to snap to wrong circle vs wide recovery range)
-        hough_verify_min_r = int(plate_r * 0.75)
-        hough_verify_max_r = int(plate_r * 1.25)
-
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        frame_idx_counter = 0
-
-        while True:
-            # Actual container PTS — matches video.currentTime in browser exactly
-            t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-
-            ret, frame = cap.read()
-            if not ret: break
-
-            frame = rotate_frame(frame, rot)
-            gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            frame_idx_counter += 1
-
-            if frame_idx_counter % LK_REFRESH == 0:
-                fresh = seed_lk(gray, last_cx, last_cy, plate_r)
-                if fresh is not None and len(fresh) >= 4:
-                    lk_pts = fresh
-            if frame_idx_counter % TMPL_REFRESH == 0:
-                plate_tmpl = make_tmpl(gray, last_cx, last_cy)
-
-            lk_cx, lk_cy, lk_pts_new = lk_bidirectional(prev_gray, gray, lk_pts)
-
-            def _reinit(rx, ry):
-                nonlocal tracker, last_cx, last_cy, lk_pts, plate_tmpl, csrt_stale
-                tracker = make_csrt()
-                tracker.init(frame, clamp_bbox(bbox_from_center(rx, ry, plate_r, 1.6), wp, hp))
-                csrt_stale = False
-                lk_pts     = seed_lk(gray, rx, ry, plate_r)
-                plate_tmpl = make_tmpl(gray, rx, ry)
-                last_cx, last_cy = rx, ry
-                return rx, ry
-
-            def run_csrt():
-                nonlocal csrt_stale
-                if csrt_stale:
-                    tracker.init(frame, clamp_bbox(bbox_from_center(last_cx, last_cy, plate_r, 1.6), wp, hp))
-                    csrt_stale = False
-                ok, bbox = tracker.update(frame)
+            plate_r = r0
+            tracker = make_tracker()
+            tracker.init(f0s, clamp_bbox(bbox_from_center(cx0, cy0, r0, 1.6), wp, hp))
+            del f0s
+            kal = Kalman2D()
+            results = []
+            last_cx, last_cy = cx0, cy0
+            max_jump_sq = (plate_r*5)**2
+            reinit_half = int(plate_r*4)
+            skip = max(1, total//600)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            fn = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret: break
+                if fn % skip != 0:
+                    fn += 1; continue
+                frame = rotate_frame(frame, rot)
+                small = cv2.resize(frame, (wp, hp))
+                t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                del frame
+                ok, bbox = tracker.update(small)
+                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                def try_reinit(gf, cf):
+                    nonlocal tracker, last_cx, last_cy
+                    rd = hough_detect(gf, int(plate_r*0.6), int(plate_r*1.4), (last_cx-reinit_half, last_cy-reinit_half, reinit_half*2, reinit_half*2))
+                    if rd:
+                        rx, ry, _ = rd
+                        tracker = make_tracker()
+                        tracker.init(cf, clamp_bbox(bbox_from_center(rx, ry, plate_r, 1.6), wp, hp))
+                        kx2, ky2 = kal.update(rx, ry)
+                        last_cx, last_cy = rx, ry
+                        return kx2, ky2
+                    return None
                 if ok:
-                    cx2 = bbox[0]+bbox[2]/2; cy2 = bbox[1]+bbox[3]/2
-                    if (cx2-last_cx)**2+(cy2-last_cy)**2 < (plate_r*3)**2:
-                        return cx2, cy2
-                return None, None
-
-            def pred_cx_cy():
-                if len(vel_history) < 2: return last_cx, last_cy
-                weights = list(range(1, len(vel_history)+1))
-                vx = float(np.average([v[0] for v in vel_history], weights=weights))
-                vy = float(np.average([v[1] for v in vel_history], weights=weights))
-                return last_cx + vx * 0.8, last_cy + vy * 0.8
-
-            def try_recover():
-                pcx, pcy = pred_cx_cy()
-                for sx, sy in [(pcx, pcy), (last_cx, last_cy)]:
-                    sb = (sx-reinit_half, sy-reinit_half, reinit_half*2, reinit_half*2)
-                    rd = hough_detect(gray, int(plate_r*0.6), int(plate_r*1.5), sb,
-                                      extra_sensitive=True)
-                    if rd: return _reinit(rd[0], rd[1])
-                for sx, sy in [(pcx, pcy), (last_cx, last_cy)]:
-                    tm = template_match(gray, plate_tmpl, sx, sy, tmpl_half)
-                    if tm: return _reinit(tm[0], tm[1])
-                cx2, cy2 = run_csrt()
-                if cx2 is not None: return _reinit(cx2, cy2)
-                rd2 = hough_detect(gray, int(plate_r*0.6), int(plate_r*1.5),
-                                   extra_sensitive=True)
-                if rd2:
-                    rx, ry, _ = rd2
-                    if (rx-last_cx)**2+(ry-last_cy)**2 < (plate_r*12)**2:
-                        return _reinit(rx, ry)
-                return None
-
-            # Zero-delay decision — no hold frames ever
-            if lk_cx is not None:
-                lk_jump = (lk_cx-last_cx)**2 + (lk_cy-last_cy)**2
-                if lk_jump > immediate_gate_sq:
-                    res = try_recover()
-                    cx, cy = res if res else pred_cx_cy()
-                    vel_history.clear()
-                elif lk_jump > normal_gate_sq:
-                    res = try_recover()
-                    if res:
-                        cx, cy = res
-                        vel_history.clear()
+                    cx = bbox[0]+bbox[2]/2; cy = bbox[1]+bbox[3]/2
+                    if (cx-last_cx)**2+(cy-last_cy)**2 > max_jump_sq:
+                        res = try_reinit(gray, small)
+                        kx, ky = res if res else kal.predict()
                     else:
-                        cx, cy = pred_cx_cy()
+                        kx, ky = kal.update(cx, cy)
+                        last_cx, last_cy = cx, cy
                 else:
-                    cx, cy = phase_corr_refine(prev_gray, gray, last_cx, last_cy,
-                                               lk_cx, lk_cy, plate_r)
+                    res = try_reinit(gray, small)
+                    kx, ky = res if res else kal.predict()
+                del small
+                results.append({"t":round(t,4),"x":round(kx/wp,5),"y":round(ky/hp,5)})
+                if len(results) % 30 == 0:
+                    pct = min(99, int(fn/max(total,1)*100))
+                    yield json.dumps({"progress": pct}) + "\n"
+                    await asyncio.sleep(0)
+                fn += 1
+            cap.release()
+            yield json.dumps({"done":True,"frames":results,"cap_w":raw_w,"cap_h":raw_h,"fps":fps,"rotation":rot}) + "\n"
+        except Exception as e:
+            yield json.dumps({"error": str(e)}) + "\n"
+        finally:
+            try: os.unlink(tmp)
+            except: pass
 
-                    # ── ECCENTRIC-PHASE FIX: periodic Hough re-anchor ─────────
-                    # During fast eccentric descent, LK features can drift due to
-                    # motion blur — the dot gradually lags behind the plate.
-                    # Every HOUGH_VERIFY frames, run Hough on a tight box around
-                    # our current position. If it finds the actual circle and it's
-                    # close (within 2× plate_r), SNAP to the true circle center.
-                    # This corrects any LK drift every ~0.33 seconds at 30fps.
-                    if frame_idx_counter % HOUGH_VERIFY == 0:
-                        sb = (cx-reinit_half, cy-reinit_half, reinit_half*2, reinit_half*2)
-                        hv = hough_detect(gray, hough_verify_min_r, hough_verify_max_r, sb)
-                        if hv:
-                            hx, hy, _ = hv
-                            snap_dist_sq = (hx-cx)**2 + (hy-cy)**2
-                            if snap_dist_sq < (plate_r * 2.0) ** 2:
-                                # Hough found the plate nearby — snap to true circle center
-                                cx, cy = hx, hy
-                    # ─────────────────────────────────────────────────────────
-
-                    vel_history.append((cx-last_cx, cy-last_cy))
-                    last_cx, last_cy = cx, cy
-                    csrt_stale = True
-            else:
-                res = try_recover()
-                if res:
-                    cx, cy = res
-                    vel_history.clear()
-                else:
-                    cx, cy = pred_cx_cy()
-
-            if lk_pts_new is not None: lk_pts = lk_pts_new
-            prev_gray = gray.copy()
-            del frame
-
-            results.append({"t": round(t, 6), "x": round(cx/wp, 5), "y": round(cy/hp, 5)})
-
-        cap.release()
-        return {"frames": results, "cap_w": raw_w, "cap_h": raw_h,
-                "fps": fps, "rotation": rot, "frame_count": len(results)}
-    finally:
-        try: os.unlink(tmp)
-        except: pass
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
