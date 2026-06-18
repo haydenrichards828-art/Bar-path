@@ -3,11 +3,10 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="2.3.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
-CLAHE            = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 TARGET_RES       = 1920
 
 def get_rotation(path):
@@ -27,8 +26,7 @@ def normalise_video(path):
         stream = info.get("streams",[{}])[0]
         w=int(stream.get("width",0)); h=int(stream.get("height",0))
         codec=stream.get("codec_name","")
-        heavy = codec not in ("h264","hevc","vp9","av1","vp8")
-        if max(w,h)<=TARGET_RES and not heavy: return path
+        if max(w,h)<=TARGET_RES and codec in ("h264","hevc","vp9","av1","vp8"): return path
         out=path+"_norm.mp4"
         scale=f"scale='if(gt(iw,ih),{TARGET_RES},-2)':'if(gt(iw,ih),-2,{TARGET_RES})'"
         r2=subprocess.run(["ffmpeg","-i",path,"-vf",scale,
@@ -44,15 +42,12 @@ def rotate_frame(frame, rot):
     if rot==270: return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     return frame
 
-def enhance(gray):
-    return CLAHE.apply(gray)
-
-def hough_detect(enh, min_r, max_r, cx_hint, cy_hint, search_pad):
-    h,w=enh.shape
-    sx=max(0,int(cx_hint-search_pad)); sy=max(0,int(cy_hint-search_pad))
-    ex=min(w,int(cx_hint+search_pad)); ey=min(h,int(cy_hint+search_pad))
+def hough_find(gray, min_r, max_r, cx_hint, cy_hint, pad):
+    h,w=gray.shape
+    sx=max(0,int(cx_hint-pad)); sy=max(0,int(cy_hint-pad))
+    ex=min(w,int(cx_hint+pad)); ey=min(h,int(cy_hint+pad))
     if ex-sx<10 or ey-sy<10: return None
-    roi=enh[sy:ey,sx:ex]; b=cv2.GaussianBlur(roi,(9,9),2)
+    roi=gray[sy:ey,sx:ex]; b=cv2.GaussianBlur(roi,(9,9),2)
     for p2 in [30,24,18,12,8,5]:
         c=cv2.HoughCircles(b,cv2.HOUGH_GRADIENT,1.2,(ey-sy)//2,param1=80,param2=p2,minRadius=min_r,maxRadius=max_r)
         if c is not None:
@@ -60,63 +55,24 @@ def hough_detect(enh, min_r, max_r, cx_hint, cy_hint, search_pad):
             return float(best[0]+sx),float(best[1]+sy),float(best[2])
     return None
 
-def hough_recover(enh, cx, cy, plate_r):
-    min_r=int(plate_r*0.5); max_r=int(plate_r*1.6)
-    for scale in [2.5,4.0,6.0,9.0]:
-        result=hough_detect(enh,min_r,max_r,cx,cy,plate_r*scale)
-        if result:
-            _,_,rr=result
-            if 0.45*plate_r<rr<1.8*plate_r: return result
-    return None
-
-def refine_center_radial(enh, cx, cy, r, n_rays=16):
-    h,w=enh.shape; edge_pts=[]; search=max(4,int(r*0.18))
-    for i in range(n_rays):
-        angle=np.radians(i*360.0/n_rays); dx=np.cos(angle); dy=np.sin(angle)
-        ex_=cx+r*0.95*dx; ey_=cy+r*0.95*dy
-        best_grad=0; best_x=None; best_y=None
-        for d in range(-search,search+1):
-            px=int(round(ex_+d*dx)); py=int(round(ey_+d*dy))
-            if 2<=px<w-2 and 2<=py<h-2:
-                gx=float(enh[py,px+1])-float(enh[py,px-1])
-                gy=float(enh[py+1,px])-float(enh[py-1,px])
-                g=abs(gx*dx+gy*dy)
-                if g>best_grad: best_grad=g; best_x=px; best_y=py
-        if best_x is not None and best_grad>8: edge_pts.append((best_x,best_y))
-    if len(edge_pts)<6: return cx,cy
-    pts=np.array(edge_pts,dtype=np.float64); xs,ys=pts[:,0],pts[:,1]
-    A=np.column_stack([xs,ys,np.ones(len(xs))]); b2=-(xs**2+ys**2)
-    try:
-        res,_,_,_=np.linalg.lstsq(A,b2,rcond=None); D,E,_=res
-        ncx,ncy=-D/2.0,-E/2.0
-        if (ncx-cx)**2+(ncy-cy)**2<(r*0.3)**2: return float(ncx),float(ncy)
-    except: pass
-    return cx,cy
-
-def dense_flow_displacement(prev_raw, curr_raw, cx, cy, plate_r, wp, hp):
-    """Compute plate displacement using Farneback dense optical flow on the plate ROI.
-    Uses ALL pixels inside the plate circle — no feature drift possible."""
-    pad = int(plate_r * 1.6)
-    x0=max(0,int(cx)-pad); y0=max(0,int(cy)-pad)
-    x1=min(wp,int(cx)+pad); y1=min(hp,int(cy)+pad)
-    if x1-x0<10 or y1-y0<10: return 0.0, 0.0, False
-    roi_p=prev_raw[y0:y1,x0:x1]
-    roi_c=curr_raw[y0:y1,x0:x1]
-    try:
-        flow=cv2.calcOpticalFlowFarneback(
-            roi_p, roi_c, None,
-            pyr_scale=0.5, levels=3, winsize=15,
-            iterations=3, poly_n=5, poly_sigma=1.1, flags=0)
-    except: return 0.0, 0.0, False
-    h_roi,w_roi=roi_p.shape
-    cx_roi=cx-x0; cy_roi=cy-y0
-    Y,X=np.ogrid[:h_roi,:w_roi]
-    mask=(X-cx_roi)**2+(Y-cy_roi)**2 < (plate_r*0.85)**2
-    flow_pts=flow[mask]  # shape (N, 2)
-    if len(flow_pts)<20: return 0.0, 0.0, False
-    dx=float(np.median(flow_pts[:,0]))
-    dy=float(np.median(flow_pts[:,1]))
-    return dx, dy, True
+def template_match(gray, tmpl, cx, cy, search_r):
+    """Find template in gray frame within search_r pixels of (cx,cy).
+    Returns (new_cx, new_cy, confidence) or None."""
+    th,tw=tmpl.shape; h,w=gray.shape
+    half_tw=tw//2; half_th=th//2
+    sx=max(0,int(cx-search_r-half_tw))
+    sy=max(0,int(cy-search_r-half_th))
+    ex=min(w-tw,int(cx+search_r-half_tw)+1)
+    ey=min(h-th,int(cy+search_r-half_th)+1)
+    if ex<=sx or ey<=sy: return None
+    region=gray[sy:ey+th, sx:ex+tw]
+    if region.shape[0]<th or region.shape[1]<tw: return None
+    result=cv2.matchTemplate(region,tmpl,cv2.TM_CCOEFF_NORMED)
+    _,max_val,_,max_loc=cv2.minMaxLoc(result)
+    if max_val<0.25: return None
+    ncx=float(sx+max_loc[0]+half_tw)
+    ncy=float(sy+max_loc[1]+half_th)
+    return ncx,ncy,max_val
 
 def smooth_coords(xs,ys,window=5):
     if len(xs)<window: return xs,ys
@@ -146,7 +102,7 @@ def detect_reps(frames,min_frames=8):
     return merged
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"2.3.0"}
+def health(): return {"status":"ok","version":"3.0.0"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -172,67 +128,69 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             ret,f0=cap.read()
             if not ret: yield json.dumps({"error":"Cannot read first frame"})+"\n"; return
             f0=rotate_frame(f0,rot); raw_h,raw_w=f0.shape[:2]; wp,hp=raw_w,raw_h
-            raw0=cv2.cvtColor(f0,cv2.COLOR_BGR2GRAY)
-            enh0=enhance(raw0); del f0
+            g0=cv2.cvtColor(f0,cv2.COLOR_BGR2GRAY); del f0
             try: p=json.loads(params)
             except: p={}
             tx=float(p.get("start_x",0.5))*wp; ty=float(p.get("start_y",0.5))*hp
             min_r=max(10,int(hp*0.05)); max_r=min(wp//2,int(hp*0.47))
-            det=hough_detect(enh0,min_r,max_r,tx,ty,int(min(wp,hp)*0.35))
-            if det is None: det=hough_detect(enh0,min_r,max_r,wp//2,hp//2,min(wp,hp)//2)
+
+            # Find plate circle from frame 0
+            eq0=cv2.equalizeHist(g0)
+            det=hough_find(eq0,min_r,max_r,tx,ty,int(min(wp,hp)*0.35))
+            if det is None: det=hough_find(eq0,min_r,max_r,wp//2,hp//2,min(wp,hp)//2)
             if det is None: det=(tx,ty,max(min_r*2,int(hp*0.09)))
             cx,cy,plate_r=det; plate_r=max(min_r,plate_r)
-            cx,cy=refine_center_radial(enh0,cx,cy,plate_r)
             px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
-            prev_raw=raw0.copy(); del raw0,enh0
+
+            # Build initial template — padded square around plate
+            tpad=int(plate_r*1.3)
+            def make_template(gray, ecx, ecy, tpad):
+                x0=max(0,int(ecx)-tpad); y0=max(0,int(ecy)-tpad)
+                x1=min(gray.shape[1],int(ecx)+tpad); y1=min(gray.shape[0],int(ecy)+tpad)
+                if x1-x0<10 or y1-y0<10: return None
+                return gray[y0:y1,x0:x1].copy()
+
+            template=make_template(g0,cx,cy,tpad); del g0
+            if template is None: yield json.dumps({"error":"Could not build template"})+"\n"; return
+
             results=[{"t":0.0,"x":round(cx/wp,5),"y":round(cy/hp,5)}]
             yield json.dumps({"frame":results[0]})+"\n"
-            frames_since_hough=0; HOUGH_EVERY=10
             cap.set(cv2.CAP_PROP_POS_FRAMES,0); fn=0; last_t=0.0
+            frames_since_update=0; UPDATE_EVERY=8
 
             while True:
                 ret,frame=cap.read()
                 if not ret: break
                 frame=rotate_frame(frame,rot)
-                curr_raw=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY); del frame
-                curr_enh=enhance(curr_raw)
+                gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY); del frame
+                eqg=cv2.equalizeHist(gray)
                 msec_t=cap.get(cv2.CAP_PROP_POS_MSEC)/1000.0
                 t=msec_t if msec_t>last_t else fn/fps
 
-                # Dense Farneback on plate ROI — every pixel inside plate circle votes
-                dx,dy,ok=dense_flow_displacement(prev_raw,curr_raw,cx,cy,plate_r,wp,hp)
+                # Primary: template match with normal search radius
+                match=template_match(eqg,template,cx,cy,plate_r*3.0)
 
-                if ok:
-                    raw_cx=cx+dx
-                    raw_cy=cy+dy
-                    # Allow center to go near frame edges (only clip at absolute boundary)
-                    raw_cx=float(np.clip(raw_cx,5,wp-5))
-                    raw_cy=float(np.clip(raw_cy,5,hp-5))
-                    cx,cy=refine_center_radial(curr_enh,raw_cx,raw_cy,plate_r)
-                else:
-                    # Dense flow failed — try Hough recovery
-                    rd=hough_recover(curr_enh,cx,cy,plate_r)
-                    if rd:
-                        ncx,ncy,_=rd
-                        cx,cy=refine_center_radial(curr_enh,ncx,ncy,plate_r)
-                        frames_since_hough=0
+                if match is None:
+                    # Wider search for fast/large movements
+                    match=template_match(eqg,template,cx,cy,plate_r*6.0)
 
-                # Periodic Hough re-anchor to correct slow drift
-                frames_since_hough+=1
-                if frames_since_hough>=HOUGH_EVERY:
-                    frames_since_hough=0
-                    rd=hough_detect(curr_enh,int(plate_r*0.65),int(plate_r*1.35),cx,cy,plate_r*2.8)
-                    if rd:
-                        ncx,ncy,rr=rd
-                        if 0.55*plate_r<rr<1.7*plate_r and (ncx-cx)**2+(ncy-cy)**2<(plate_r*1.5)**2:
-                            cx,cy=refine_center_radial(curr_enh,ncx,ncy,plate_r)
-                            plate_r=plate_r*0.92+rr*0.08
-                            px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
+                if match is not None:
+                    ncx,ncy,conf=match
+                    cx,cy=ncx,ncy
+                    # Periodically update template with fresh appearance
+                    frames_since_update+=1
+                    if frames_since_update>=UPDATE_EVERY and conf>0.45:
+                        frames_since_update=0
+                        new_tmpl=make_template(gray,cx,cy,tpad)
+                        if new_tmpl is not None and new_tmpl.shape==template.shape:
+                            # Blend old and new to stay robust
+                            template=cv2.addWeighted(template,0.4,new_tmpl,0.6,0)
+                # else: hold last known position
 
-                del curr_enh
+                del eqg
                 frame_data={"t":round(t,4),"x":round(cx/wp,5),"y":round(cy/hp,5)}
                 results.append(frame_data); yield json.dumps({"frame":frame_data})+"\n"
-                prev_raw=curr_raw; fn+=1; last_t=t
+                del gray; fn+=1; last_t=t
                 if fn%30==0: await asyncio.sleep(0)
 
             cap.release()
