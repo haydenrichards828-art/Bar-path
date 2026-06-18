@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="5.0.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="6.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -112,7 +112,7 @@ def detect_reps(frames,min_frames=8):
     return merged
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"5.0.0"}
+def health(): return {"status":"ok","version":"6.0.0"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -153,13 +153,13 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
 
             hist_data=build_hist(f0,cx,cy,plate_r)
             if hist_data is None: yield json.dumps({"error":"Could not build colour histogram"})+"\n"; return
-            hist,track_window=hist_data
+            hist,_=hist_data
             del f0,g0
 
             results=[{"t":0.0,"x":round(cx/wp,5),"y":round(cy/hp,5)}]
             yield json.dumps({"frame":results[0]})+"\n"
             cap.set(cv2.CAP_PROP_POS_FRAMES,0); fn=0; last_t=0.0
-            frames_since_hough=0; HOUGH_EVERY=6; bad_streak=0
+            vx,vy=0.0,0.0; vel_hist=[]; bad_streak=0
 
             while True:
                 ret,frame=cap.read()
@@ -168,24 +168,37 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 msec_t=cap.get(cv2.CAP_PROP_POS_MSEC)/1000.0
                 t=msec_t if msec_t>last_t else fn/fps
 
-                pos,track_window=camshift_step(frame,hist,track_window)
-                if pos is not None:
-                    cx,cy=pos; bad_streak=0
-                else:
-                    bad_streak+=1
+                # Velocity-predicted position for this frame
+                pred_cx=max(plate_r,min(wp-plate_r,cx+vx))
+                pred_cy=max(plate_r,min(hp-plate_r,cy+vy))
+                speed=(vx**2+vy**2)**0.5
 
-                frames_since_hough+=1
-                if frames_since_hough>=HOUGH_EVERY or bad_streak>=2:
-                    frames_since_hough=0
-                    gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
-                    pad=plate_r*(2.0 if bad_streak<2 else 5.0)
-                    rd=hough_find(gray,int(plate_r*0.75),int(plate_r*1.25),cx,cy,pad)
-                    if rd:
-                        ncx,ncy,rr=rd
-                        if 0.75*plate_r<rr<1.25*plate_r:
-                            cx,cy=ncx,ncy; bad_streak=0
-                            x0=max(0,int(cx-plate_r)); y0=max(0,int(cy-plate_r))
-                            track_window=(x0,y0,int(plate_r*2),int(plate_r*2))
+                # Primary: Hough every frame, searched around the predicted position.
+                # Search radius grows with recent speed so fast motion doesn't escape.
+                gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
+                search_pad=plate_r*1.5+speed*2.5
+                found=hough_find(gray,int(plate_r*0.75),int(plate_r*1.25),
+                                 pred_cx,pred_cy,search_pad)
+
+                if found:
+                    new_cx,new_cy,_=found
+                    vel_hist.append((new_cx-cx,new_cy-cy))
+                    if len(vel_hist)>3: vel_hist.pop(0)
+                    vx=sum(v[0] for v in vel_hist)/len(vel_hist)
+                    vy=sum(v[1] for v in vel_hist)/len(vel_hist)
+                    cx,cy=new_cx,new_cy; bad_streak=0
+                else:
+                    # Fallback: CamShift anchored to predicted position.
+                    # Velocity is NOT updated from CamShift to prevent drift compounding.
+                    bad_streak+=1
+                    tw=(max(0,int(pred_cx-plate_r)),max(0,int(pred_cy-plate_r)),
+                        int(plate_r*2),int(plate_r*2))
+                    pos,_=camshift_step(frame,hist,tw)
+                    if pos:
+                        cx,cy=pos
+                    else:
+                        vx*=0.85; vy*=0.85
+                        cx,cy=pred_cx,pred_cy
 
                 frame_data={"t":round(t,4),"x":round(cx/wp,5),"y":round(cy/hp,5)}
                 results.append(frame_data); yield json.dumps({"frame":frame_data})+"\n"

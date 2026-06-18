@@ -1,31 +1,29 @@
 """
-Diagnostic test for bar-path tracker.
-Usage: python test_diagnostic.py <video_path> <start_x> <start_y>
-Saves annotated frames to ./diag_frames/ and a CSV of all coordinates.
-No live window needed — works headlessly.
+Diagnostic test for bar-path tracker v6 (Hough-primary, velocity-predicted).
+Usage: python test_diagnostic.py <video_path> <start_x> <start_y> [out_tag]
+Saves annotated frames to ./diag_frames/<out_tag>/ and a CSV of all coords.
 """
 import sys, os, csv, cv2, numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
 from main import hough_find, build_hist, camshift_step
 
-VIDEO  = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\hayde\OneDrive\Pictures\IMG_3108.MOV"
-SX     = float(sys.argv[2]) if len(sys.argv) > 2 else 0.397
-SY     = float(sys.argv[3]) if len(sys.argv) > 3 else 0.238
-OUT    = os.path.join(os.path.dirname(__file__), "diag_frames")
+VIDEO   = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\hayde\OneDrive\Pictures\IMG_3108.MOV"
+SX      = float(sys.argv[2]) if len(sys.argv) > 2 else 0.397
+SY      = float(sys.argv[3]) if len(sys.argv) > 3 else 0.238
+TAG     = sys.argv[4] if len(sys.argv) > 4 else "run"
+OUT     = os.path.join(os.path.dirname(__file__), "diag_frames", TAG)
 os.makedirs(OUT, exist_ok=True)
 
-# Save a frame with tracking annotation drawn on it
-def save_frame(frame, cx, cy, plate_r, fn, label="", color=(0, 0, 255)):
-    vis = frame.copy()
-    # Downscale for manageable file sizes (save at 540px wide)
-    scale = 540.0 / vis.shape[1]
-    scx, scy, sr = int(cx * scale), int(cy * scale), max(2, int(plate_r * scale))
-    vis = cv2.resize(vis, None, fx=scale, fy=scale)
-    cv2.circle(vis, (scx, scy), sr, color, 2)
-    cv2.circle(vis, (scx, scy), 4, (0, 255, 0), -1)
-    cv2.putText(vis, f"f{fn} {label}", (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2)
-    cv2.putText(vis, f"f{fn} {label}", (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,0,0), 1)
-    cv2.putText(vis, f"({cx/frame.shape[1]:.3f}, {cy/frame.shape[0]:.3f})", (8, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,0), 2)
+def save_frame(frame, cx, cy, plate_r, fn, label="", color=(0,0,255)):
+    scale = 540.0 / frame.shape[1]
+    vis = cv2.resize(frame, None, fx=scale, fy=scale)
+    scx,scy,sr = int(cx*scale), int(cy*scale), max(2,int(plate_r*scale))
+    cv2.circle(vis, (scx,scy), sr, color, 2)
+    cv2.circle(vis, (scx,scy), 4, (0,255,0), -1)
+    cv2.putText(vis, f"f{fn} {label}", (8,24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2)
+    cv2.putText(vis, f"f{fn} {label}", (8,24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,0,0), 1)
+    cv2.putText(vis, f"({cx/frame.shape[1]:.3f},{cy/frame.shape[0]:.3f})", (8,50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,0), 2)
     path = os.path.join(OUT, f"frame_{fn:05d}_{label}.jpg")
     cv2.imwrite(path, vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return path
@@ -40,148 +38,125 @@ ret, f0 = cap.read()
 if not ret:
     print("ERROR: Cannot read first frame"); sys.exit(1)
 
-h, w = f0.shape[:2]
-tx, ty = SX * w, SY * h
+h,w = f0.shape[:2]
+tx,ty = SX*w, SY*h
 print(f"Video: {w}x{h} @ {fps:.1f}fps, {total} frames ({total/fps:.1f}s)")
-print(f"Tap pixel: ({tx:.0f}, {ty:.0f}) = normalized ({SX}, {SY})")
+print(f"Tap: ({tx:.0f},{ty:.0f})")
 
-min_r = max(10, int(h * 0.05))
-max_r = min(w // 2, int(h * 0.47))
-print(f"Hough radius search: {min_r}–{max_r}px")
-
-det = hough_find(cv2.cvtColor(f0, cv2.COLOR_BGR2GRAY), min_r, max_r, tx, ty, int(min(w,h)*0.35))
+short_side = min(w,h)
+min_r = max(10, int(short_side*0.05))
+max_r = int(short_side*0.30)
+g0 = cv2.cvtColor(f0, cv2.COLOR_BGR2GRAY)
+det = hough_find(g0, min_r, max_r, tx, ty, int(short_side*0.35))
 if det is None:
-    det = hough_find(cv2.cvtColor(f0, cv2.COLOR_BGR2GRAY), min_r, max_r, w//2, h//2, min(w,h)//2)
+    det = hough_find(g0, min_r, max_r, w//2, h//2, short_side//2)
 if det is None:
-    print("WARNING: Hough failed frame 0 — using tap point as fallback")
-    det = (tx, ty, max(min_r * 2, int(h * 0.09)))
+    print("WARNING: Hough failed frame 0 — using tap as fallback")
+    det = (tx, ty, max(min_r*2, int(h*0.09)))
 
-cx, cy, plate_r = det
+cx,cy,plate_r = det
 plate_r = max(min_r, plate_r)
-print(f"Frame 0 plate: center=({cx:.0f},{cy:.0f}) r={plate_r:.0f}px ({plate_r/h*100:.1f}% of height)")
+print(f"Frame 0 plate: ({cx:.0f},{cy:.0f}) r={plate_r:.0f}px")
 
 hist_data = build_hist(f0, cx, cy, plate_r)
 if hist_data is None:
     print("ERROR: Could not build histogram"); sys.exit(1)
-hist, track_window = hist_data
-
-# Check how many pixels survived the mask (circular + HSV)
-roi_x0, roi_y0 = max(0, int(cx - plate_r)), max(0, int(cy - plate_r))
-roi_x1, roi_y1 = min(w, int(cx + plate_r)), min(h, int(cy + plate_r))
-roi = f0[roi_y0:roi_y1, roi_x0:roi_x1]
-roi_h2, roi_w2 = roi.shape[:2]
-Ygrid2, Xgrid2 = np.ogrid[:roi_h2, :roi_w2]
-circ_mask2 = ((Xgrid2 - (cx - roi_x0))**2 + (Ygrid2 - (cy - roi_y0))**2 <= plate_r**2).astype(np.uint8) * 255
-hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-hsv_mask2 = cv2.inRange(hsv_roi, np.array((0., 40., 40.)), np.array((180., 255., 255.)))
-combined = cv2.bitwise_and(circ_mask2, hsv_mask2)
-circ_total = np.count_nonzero(circ_mask2)
-valid_px = np.count_nonzero(combined)
-valid_pct = 100.0 * valid_px / max(1, circ_total)
-print(f"Circular mask pixels: {circ_total}, survived S>40,V>40 filter: {valid_px} ({valid_pct:.1f}%)")
-if valid_pct < 5.0:
-    print("  WARNING: <5% of plate disc pixels survived the mask — histogram may be unreliable")
-
+hist,_ = hist_data
 save_frame(f0, cx, cy, plate_r, 0, "INIT")
 
-# Tracking loop
+# --- Tracking loop (mirrors main.py v6 exactly) ---
 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-frames_since_hough = 0
-HOUGH_EVERY = 6
+vx,vy = 0.0, 0.0
+vel_hist = []
 bad_streak = 0
 fn = 0
-results = [{"fn": 0, "cx": cx, "cy": cy, "nx": cx/w, "ny": cy/h, "event": "init"}]
+results = [{"fn":0,"cx":cx,"cy":cy,"nx":cx/w,"ny":cy/h,"speed":0.0,"source":"init"}]
 
-# For drift/freeze detection
-prev_cx, prev_cy = cx, cy
-freeze_count = 0
-FREEZE_THRESH_PX = 3.0   # pixels — less than this = frozen
-JUMP_THRESH_PX   = plate_r * 0.5  # half plate radius = suspicious jump
+SNAP_EVERY = max(1, total // 40)  # ~40 snapshots across the video
 
-# Save every SNAP_EVERY frames plus anomaly frames
-SNAP_EVERY = max(1, total // 30)  # ~30 snapshots across the video
-saved_frames = []
+# Track per-frame speed so we can find the fastest frames later
+prev_cx,prev_cy = cx,cy
 
 while True:
-    ret, frame = cap.read()
+    ret,frame = cap.read()
     if not ret: break
     fn += 1
 
-    pos, track_window = camshift_step(frame, hist, track_window)
-    if pos is not None:
-        cx, cy = pos; bad_streak = 0
+    pred_cx = max(plate_r, min(w-plate_r, cx+vx))
+    pred_cy = max(plate_r, min(h-plate_r, cy+vy))
+    speed = (vx**2+vy**2)**0.5
+    search_pad = plate_r*1.5 + speed*2.5
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    found = hough_find(gray, int(plate_r*0.75), int(plate_r*1.25),
+                       pred_cx, pred_cy, search_pad)
+
+    source = ""
+    color = (0,0,255)  # red = normal
+    if found:
+        new_cx,new_cy,_ = found
+        vel_hist.append((new_cx-cx, new_cy-cy))
+        if len(vel_hist)>3: vel_hist.pop(0)
+        vx = sum(v[0] for v in vel_hist)/len(vel_hist)
+        vy = sum(v[1] for v in vel_hist)/len(vel_hist)
+        cx,cy = new_cx,new_cy; bad_streak=0
+        source="hough"
+        color=(255,128,0)  # blue = hough found
     else:
         bad_streak += 1
+        tw=(max(0,int(pred_cx-plate_r)),max(0,int(pred_cy-plate_r)),
+            int(plate_r*2),int(plate_r*2))
+        pos,_ = camshift_step(frame, hist, tw)
+        if pos:
+            cx,cy = pos; source="camshift"
+            color=(0,165,255)  # orange = camshift fallback
+        else:
+            vx*=0.85; vy*=0.85
+            cx,cy=pred_cx,pred_cy; source="predict"
+            color=(0,0,200)  # dark red = pure prediction
 
-    frames_since_hough += 1
-    hough_fired = False
-    if frames_since_hough >= HOUGH_EVERY or bad_streak >= 2:
-        frames_since_hough = 0
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        pad = plate_r * (1.8 if bad_streak < 2 else 5.0)
-        rd = hough_find(gray, int(plate_r * 0.6), int(plate_r * 1.5), cx, cy, pad)
-        if rd:
-            ncx, ncy, rr = rd
-            if 0.5 * plate_r < rr < 1.8 * plate_r:
-                cx, cy = ncx, ncy; bad_streak = 0
-                x0, y0 = max(0, int(cx - plate_r)), max(0, int(cy - plate_r))
-                track_window = (x0, y0, int(plate_r * 2), int(plate_r * 2))
-                new_hist = build_hist(frame, cx, cy, plate_r)
-                if new_hist: hist, _ = new_hist
-                hough_fired = True
+    frame_speed = ((cx-prev_cx)**2+(cy-prev_cy)**2)**0.5
+    results.append({"fn":fn,"cx":cx,"cy":cy,"nx":cx/w,"ny":cy/h,
+                    "speed":round(frame_speed,1),"source":source})
+    prev_cx,prev_cy = cx,cy
 
-    # Anomaly detection
-    dist = np.hypot(cx - prev_cx, cy - prev_cy)
-    event = ""
-    anomaly_color = (0, 0, 255)  # red = normal
-
-    if dist < FREEZE_THRESH_PX:
-        freeze_count += 1
-    else:
-        freeze_count = 0
-
-    if freeze_count == 10:
-        event = "FREEZE"
-        anomaly_color = (0, 165, 255)  # orange
-        print(f"  [f{fn}] FREEZE detected — tracker stuck at ({cx:.0f},{cy:.0f}) for 10+ frames")
-    elif dist > JUMP_THRESH_PX:
-        event = f"JUMP{dist:.0f}px"
-        anomaly_color = (0, 0, 255)  # red
-        print(f"  [f{fn}] JUMP {dist:.0f}px  ({prev_cx:.0f},{prev_cy:.0f})->({cx:.0f},{cy:.0f})")
-
-    if hough_fired and not event:
-        event = "hough"
-        anomaly_color = (255, 128, 0)  # blue
-
-    results.append({"fn": fn, "cx": cx, "cy": cy, "nx": cx/w, "ny": cy/h, "event": event})
-
-    # Save snapshot
-    should_save = (fn % SNAP_EVERY == 0) or bool(event)
+    # Save snaps: every SNAP_EVERY frames + any frame where source != hough
+    should_save = (fn % SNAP_EVERY == 0) or (source != "hough")
     if should_save:
-        p = save_frame(frame, cx, cy, plate_r, fn, event or "snap", anomaly_color)
-        saved_frames.append(p)
-
-    prev_cx, prev_cy = cx, cy
+        save_frame(frame, cx, cy, plate_r, fn, source or "snap", color)
 
 cap.release()
 
 # Write CSV
-csv_path = os.path.join(os.path.dirname(__file__), "diag_coords.csv")
+csv_path = os.path.join(os.path.dirname(__file__), f"diag_coords_{TAG}.csv")
 with open(csv_path, "w", newline="") as f:
-    writer = csv.DictWriter(f, fieldnames=["fn", "cx", "cy", "nx", "ny", "event"])
+    writer = csv.DictWriter(f, fieldnames=["fn","cx","cy","nx","ny","speed","source"])
     writer.writeheader()
     writer.writerows(results)
 
-# Summary stats
+# Summary
 nys = np.array([r["ny"] for r in results])
-nxs = np.array([r["nx"] for r in results])
-print(f"\n=== Tracking Summary ===")
-print(f"Frames processed: {fn}")
-print(f"Y range (normalized): {nys.min():.3f} – {nys.max():.3f}  (span={nys.max()-nys.min():.3f})")
-print(f"X range (normalized): {nxs.min():.3f} – {nxs.max():.3f}  (span={nxs.max()-nxs.min():.3f})")
-anomalies = [r for r in results if r["event"] and r["event"] not in ("init", "hough", "snap")]
-print(f"Anomaly events (freeze/jump): {len(anomalies)}")
-for a in anomalies[:20]:
-    print(f"  f{a['fn']}: {a['event']} at ({a['nx']:.3f},{a['ny']:.3f})")
-print(f"\nSaved {len(saved_frames)} annotated frames to {OUT}/")
-print(f"Full coordinate log: {csv_path}")
+speeds = np.array([r["speed"] for r in results])
+sources = [r["source"] for r in results]
+hough_pct = 100*sources.count("hough")/max(1,len(sources))
+fallback_pct = 100*(sources.count("camshift")+sources.count("predict"))/max(1,len(sources))
+
+print(f"\n=== Tracking Summary ({TAG}) ===")
+print(f"Frames: {fn}")
+print(f"Y range: {nys.min():.3f} - {nys.max():.3f}  span={nys.max()-nys.min():.3f}")
+print(f"Source breakdown: hough={hough_pct:.1f}%  fallback={fallback_pct:.1f}%")
+print(f"Speed: mean={speeds.mean():.1f}px/frame  max={speeds.max():.1f}px/frame")
+
+# Fastest frames (top 20 by per-frame displacement)
+fast_frames = sorted(results, key=lambda r: r["speed"], reverse=True)[:20]
+print(f"\nTop 20 fastest frames (where tracking is hardest):")
+for r in fast_frames:
+    print(f"  f{r['fn']:4d}: speed={r['speed']:5.1f}px/frame  source={r['source']:8s}  y={r['ny']:.3f}")
+
+non_hough = [r for r in results if r["source"] not in ("hough","init")]
+print(f"\nFallback frames (not Hough): {len(non_hough)}")
+for r in non_hough[:30]:
+    print(f"  f{r['fn']}: {r['source']} at y={r['ny']:.3f} speed={r['speed']:.1f}px")
+
+print(f"\nSaved frames to {OUT}/")
+print(f"CSV: {csv_path}")
