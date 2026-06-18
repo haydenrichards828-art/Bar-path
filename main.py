@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="6.0.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="7.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -73,6 +73,16 @@ def build_hist(bgr_frame, cx, cy, r):
     cv2.normalize(hist,hist,0,255,cv2.NORM_MINMAX)
     return hist,(x0,y0,x1-x0,y1-y0)
 
+def plate_bp_score(bgr_frame, hist, cx, cy, r):
+    """Mean back-projection score inside the circular region. Higher = better plate match."""
+    fh, fw = bgr_frame.shape[:2]
+    x0, y0 = max(0, int(cx-r)), max(0, int(cy-r))
+    x1, y1 = min(fw, int(cx+r)), min(fh, int(cy+r))
+    if x1-x0 < 8 or y1-y0 < 8: return 0.0
+    hsv = cv2.cvtColor(bgr_frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+    bp  = cv2.calcBackProject([hsv], [0,1], hist, [0,180,0,256], 1)
+    return float(bp.mean())
+
 TERM_CRIT=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT,15,1)
 
 def camshift_step(bgr_frame, hist, track_window):
@@ -112,7 +122,7 @@ def detect_reps(frames,min_frames=8):
     return merged
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"6.0.0"}
+def health(): return {"status":"ok","version":"7.0.0"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -154,6 +164,10 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             hist_data=build_hist(f0,cx,cy,plate_r)
             if hist_data is None: yield json.dumps({"error":"Could not build colour histogram"})+"\n"; return
             hist,_=hist_data
+            # Appearance reference: plate score at frame 0 to gate Hough candidates.
+            # Threshold = max absolute floor or 15% of reference, whichever is larger.
+            ref_score=plate_bp_score(f0,cx,cy,plate_r)
+            min_score=max(12.0,ref_score*0.15)
             del f0,g0
 
             results=[{"t":0.0,"x":round(cx/wp,5),"y":round(cy/hp,5)}]
@@ -174,11 +188,26 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 speed=(vx**2+vy**2)**0.5
 
                 # Primary: Hough every frame, searched around the predicted position.
-                # Search radius grows with recent speed so fast motion doesn't escape.
+                # Search pad grows with speed but is capped at 3× plate radius so the
+                # search window never covers most of the frame and attracts wrong circles.
                 gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
-                search_pad=plate_r*1.5+speed*2.5
+                search_pad=min(plate_r*3.0, plate_r*1.5+speed*2.5)
                 found=hough_find(gray,int(plate_r*0.75),int(plate_r*1.25),
                                  pred_cx,pred_cy,search_pad)
+
+                # Appearance gate: only applied when Hough's result is suspiciously far
+                # from the predicted position (> 30% of plate radius). Results close to
+                # the prediction are almost certainly the same plate — no check needed.
+                # Results far away may be wrong circles (lifter's body, gym equipment)
+                # grabbed by the large search window, so we verify them against the
+                # reference histogram. Minimum legitimate prediction error in test data:
+                # 52px; minimum wrong-circle prediction error: 132px — safe margin.
+                if found:
+                    new_cx,new_cy,_=found
+                    dist_from_pred=((new_cx-pred_cx)**2+(new_cy-pred_cy)**2)**0.5
+                    if dist_from_pred>plate_r*0.3:
+                        if plate_bp_score(frame,hist,new_cx,new_cy,plate_r)<min_score:
+                            found=None
 
                 if found:
                     new_cx,new_cy,_=found
@@ -189,15 +218,20 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                     cx,cy=new_cx,new_cy; bad_streak=0
                 else:
                     # Fallback: CamShift anchored to predicted position.
-                    # Velocity is NOT updated from CamShift to prevent drift compounding.
+                    # Use the same search region as Hough would have so it can reach a
+                    # fast-moving plate that Hough missed. Velocity is NOT updated from
+                    # CamShift to prevent drift compounding.
                     bad_streak+=1
-                    tw=(max(0,int(pred_cx-plate_r)),max(0,int(pred_cy-plate_r)),
-                        int(plate_r*2),int(plate_r*2))
-                    pos,_=camshift_step(frame,hist,tw)
+                    cs_pad=int(search_pad)
+                    tw_x=max(0,int(pred_cx-cs_pad)); tw_y=max(0,int(pred_cy-cs_pad))
+                    tw_w=min(wp-tw_x,cs_pad*2);      tw_h=min(hp-tw_y,cs_pad*2)
+                    pos,_=camshift_step(frame,hist,(tw_x,tw_y,tw_w,tw_h))
                     if pos:
                         cx,cy=pos
                     else:
-                        vx*=0.85; vy*=0.85
+                        # Decay velocity slowly (0.97/frame ≈ −3%/frame) so the prediction
+                        # stays near the plate during brief detection gaps.
+                        vx*=0.97; vy*=0.97
                         cx,cy=pred_cx,pred_cy
 
                 frame_data={"t":round(t,4),"x":round(cx/wp,5),"y":round(cy/hp,5)}

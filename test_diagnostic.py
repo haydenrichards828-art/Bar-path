@@ -5,7 +5,7 @@ Saves annotated frames to ./diag_frames/<out_tag>/ and a CSV of all coords.
 """
 import sys, os, csv, cv2, numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
-from main import hough_find, build_hist, camshift_step
+from main import hough_find, build_hist, camshift_step, plate_bp_score
 
 VIDEO   = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\hayde\OneDrive\Pictures\IMG_3108.MOV"
 SX      = float(sys.argv[2]) if len(sys.argv) > 2 else 0.397
@@ -62,9 +62,12 @@ hist_data = build_hist(f0, cx, cy, plate_r)
 if hist_data is None:
     print("ERROR: Could not build histogram"); sys.exit(1)
 hist,_ = hist_data
+ref_score = plate_bp_score(f0, hist, cx, cy, plate_r)
+min_score = max(12.0, ref_score * 0.15)
+print(f"Appearance ref_score={ref_score:.1f}  min_score={min_score:.1f}")
 save_frame(f0, cx, cy, plate_r, 0, "INIT")
 
-# --- Tracking loop (mirrors main.py v6 exactly) ---
+# --- Tracking loop (mirrors main.py v7 exactly) ---
 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 vx,vy = 0.0, 0.0
 vel_hist = []
@@ -74,7 +77,6 @@ results = [{"fn":0,"cx":cx,"cy":cy,"nx":cx/w,"ny":cy/h,"speed":0.0,"source":"ini
 
 SNAP_EVERY = max(1, total // 40)  # ~40 snapshots across the video
 
-# Track per-frame speed so we can find the fastest frames later
 prev_cx,prev_cy = cx,cy
 
 while True:
@@ -85,14 +87,22 @@ while True:
     pred_cx = max(plate_r, min(w-plate_r, cx+vx))
     pred_cy = max(plate_r, min(h-plate_r, cy+vy))
     speed = (vx**2+vy**2)**0.5
-    search_pad = plate_r*1.5 + speed*2.5
+    search_pad = min(plate_r*3.0, plate_r*1.5 + speed*2.5)
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     found = hough_find(gray, int(plate_r*0.75), int(plate_r*1.25),
                        pred_cx, pred_cy, search_pad)
 
+    # Appearance gate: only for Hough results far from prediction (> plate_r*0.3)
+    if found:
+        fcx, fcy, _ = found
+        dist_from_pred = ((fcx-pred_cx)**2+(fcy-pred_cy)**2)**0.5
+        if dist_from_pred > plate_r * 0.3:
+            if plate_bp_score(frame, hist, fcx, fcy, plate_r) < min_score:
+                found = None
+
     source = ""
-    color = (0,0,255)  # red = normal
+    color = (0,0,255)
     if found:
         new_cx,new_cy,_ = found
         vel_hist.append((new_cx-cx, new_cy-cy))
@@ -101,19 +111,20 @@ while True:
         vy = sum(v[1] for v in vel_hist)/len(vel_hist)
         cx,cy = new_cx,new_cy; bad_streak=0
         source="hough"
-        color=(255,128,0)  # blue = hough found
+        color=(255,128,0)
     else:
         bad_streak += 1
-        tw=(max(0,int(pred_cx-plate_r)),max(0,int(pred_cy-plate_r)),
-            int(plate_r*2),int(plate_r*2))
-        pos,_ = camshift_step(frame, hist, tw)
+        cs_pad = int(search_pad)
+        tw_x = max(0, int(pred_cx-cs_pad)); tw_y = max(0, int(pred_cy-cs_pad))
+        tw_w = min(w-tw_x, cs_pad*2);       tw_h = min(h-tw_y, cs_pad*2)
+        pos,_ = camshift_step(frame, hist, (tw_x, tw_y, tw_w, tw_h))
         if pos:
             cx,cy = pos; source="camshift"
-            color=(0,165,255)  # orange = camshift fallback
+            color=(0,165,255)
         else:
-            vx*=0.85; vy*=0.85
+            vx*=0.97; vy*=0.97
             cx,cy=pred_cx,pred_cy; source="predict"
-            color=(0,0,200)  # dark red = pure prediction
+            color=(0,0,200)
 
     frame_speed = ((cx-prev_cx)**2+(cy-prev_cy)**2)**0.5
     results.append({"fn":fn,"cx":cx,"cy":cy,"nx":cx/w,"ny":cy/h,
