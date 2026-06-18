@@ -3,14 +3,13 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="1.1.1")
+app = FastAPI(title="ForceTrack Bar Path API", version="1.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 def get_rotation(path):
     try:
         r = subprocess.run(["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream_tags=rotate","-of","default=noprint_wrappers=1:nokey=1",path], capture_output=True, text=True, timeout=10)
-        v = r.stdout.strip()
-        return int(v) if v else 0
+        v = r.stdout.strip(); return int(v) if v else 0
     except: return 0
 
 def rotate_frame(frame, rot):
@@ -37,24 +36,73 @@ def seed_pts(gray, cx, cy, r):
     mask = np.zeros(gray.shape, np.uint8)
     cv2.circle(mask, (int(cx), int(cy)), int(max(4, r*0.88)), 255, -1)
     pts = cv2.goodFeaturesToTrack(gray, 120, 0.008, 3, mask=mask, blockSize=7)
-    if pts is not None and len(pts) >= 6:
-        return pts
+    if pts is not None and len(pts) >= 6: return pts
     grid = []
-    step = max(2.0, r*0.22)
-    dy = -r*0.75
+    step = max(2.0, r*0.22); dy = -r*0.75
     while dy <= r*0.75:
         dx = -r*0.75
         while dx <= r*0.75:
-            if dx*dx+dy*dy <= r*r*0.56:
-                grid.append([[cx+dx, cy+dy]])
+            if dx*dx+dy*dy <= r*r*0.56: grid.append([[cx+dx, cy+dy]])
             dx += step
         dy += step
     return np.array(grid, dtype=np.float32) if grid else np.array([[[cx,cy]]], dtype=np.float32)
 
+def smooth_coords(xs, ys, window=7):
+    """Rolling-average smoothing — removes jitter without shifting the path."""
+    if len(xs) < window: return xs, ys
+    w = window if window % 2 == 1 else window + 1
+    k = np.ones(w) / w
+    xs_s = np.convolve(xs, k, mode='same')
+    ys_s = np.convolve(ys, k, mode='same')
+    # Fix edge distortion from convolve
+    h = w // 2
+    xs_s[:h] = xs[:h]; xs_s[-h:] = xs[-h:]
+    ys_s[:h] = ys[:h]; ys_s[-h:] = ys[-h:]
+    return xs_s.tolist(), ys_s.tolist()
+
+def detect_reps(frames, min_frames=8):
+    """Detect rep boundaries by finding y-velocity direction reversals."""
+    if len(frames) < min_frames * 2: return []
+    ys = [f['y'] for f in frames]
+    ts = [f['t'] for f in frames]
+    # Compute smoothed y-velocity
+    vel = []
+    for i in range(1, len(ys)):
+        dt = max(ts[i] - ts[i-1], 0.001)
+        vel.append((ys[i] - ys[i-1]) / dt)
+    vel = [vel[0]] + vel  # pad first
+    # Rolling average of velocity
+    win = 5
+    svel = np.convolve(vel, np.ones(win)/win, mode='same').tolist()
+    reps = []
+    # Find sign changes in velocity (direction reversals)
+    # A rep = bar goes down (vel>0 since y increases downward) then back up (vel<0)
+    direction = None
+    rep_start = 0
+    for i, v in enumerate(svel):
+        if abs(v) < 0.002: continue  # dead zone
+        new_dir = 'down' if v > 0 else 'up'
+        if direction is None:
+            direction = new_dir; rep_start = i; continue
+        if new_dir != direction:
+            if i - rep_start >= min_frames:
+                reps.append({'start': rep_start, 'end': i, 'phase': direction})
+            direction = new_dir; rep_start = i
+    # Merge consecutive down/up into full reps
+    merged = []
+    i = 0
+    while i < len(reps) - 1:
+        if reps[i]['phase'] == 'down' and reps[i+1]['phase'] == 'up':
+            merged.append({'start': reps[i]['start'], 'end': reps[i+1]['end']})
+            i += 2
+        else:
+            i += 1
+    return merged
+
 LK = dict(winSize=(31,31), maxLevel=4, criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT, 30, 0.01))
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"1.1.1"}
+def health(): return {"status":"ok","version":"1.2.0"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -80,26 +128,22 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             raw_h, raw_w = f0.shape[:2]
             wp, hp = int(raw_w*0.5), int(raw_h*0.5)
             f0s = cv2.resize(f0, (wp, hp))
-            g0  = cv2.cvtColor(f0s, cv2.COLOR_BGR2GRAY)
+            g0 = cv2.cvtColor(f0s, cv2.COLOR_BGR2GRAY)
             del f0, f0s
             try: p = json.loads(params)
             except: p = {}
             tx = float(p.get("start_x", 0.5)) * wp
             ty = float(p.get("start_y", 0.5)) * hp
-            min_r = max(8, int(hp*0.05))
-            max_r = min(wp//2, int(hp*0.47))
+            min_r = max(8, int(hp*0.05)); max_r = min(wp//2, int(hp*0.47))
             pad = int(min(wp,hp)*0.35)
             det = hough_detect(g0, min_r, max_r, tx, ty, pad)
             if det is None: det = hough_detect(g0, min_r, max_r, wp//2, hp//2, min(wp,hp)//2)
             if det is None: det = (tx, ty, max(min_r*2, int(hp*0.09)))
-            cx, cy, plate_r = det
-            plate_r = max(min_r, plate_r)
+            cx, cy, plate_r = det; plate_r = max(min_r, plate_r)
             prev_gray = g0.copy()
             p0 = seed_pts(g0, cx, cy, plate_r)
             del g0
-            results = []
-            frames_since_hough = 0
-            HOUGH_EVERY = 10
+            results = []; frames_since_hough = 0; HOUGH_EVERY = 10
             proc_every = max(1, total // 600)
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             fn = 0; proc = 0
@@ -113,8 +157,8 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 curr_gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
                 del small
                 if fn % proc_every == 0:
-                    p1, sf, _  = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, p0, None, **LK)
-                    p0r, sb, _ = cv2.calcOpticalFlowPyrLK(curr_gray, prev_gray, p1,  None, **LK)
+                    p1, sf, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, p0, None, **LK)
+                    p0r, sb, _ = cv2.calcOpticalFlowPyrLK(curr_gray, prev_gray, p1, None, **LK)
                     fb = np.abs(p0 - p0r).reshape(-1,2).max(axis=1)
                     good = (sf.ravel()==1)&(sb.ravel()==1)&(fb<1.5)
                     if good.sum() >= 4:
@@ -149,7 +193,37 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 prev_gray = curr_gray
                 fn += 1
             cap.release()
-            yield json.dumps({"done":True,"frames":results,"cap_w":raw_w,"cap_h":raw_h,"fps":fps,"rotation":rot})+"\n"
+
+            # ── Post-process: smooth coords, detect reps, compute metrics ──
+            if results:
+                xs = np.array([f['x'] for f in results])
+                ys = np.array([f['y'] for f in results])
+                xs_s, ys_s = smooth_coords(xs.tolist(), ys.tolist(), window=9)
+                for i, f in enumerate(results):
+                    f['x'] = round(xs_s[i], 5)
+                    f['y'] = round(ys_s[i], 5)
+
+            reps = detect_reps(results)
+
+            # Compute per-rep metrics (ROM + mean/peak pixel velocity)
+            rep_metrics = []
+            for rep in reps:
+                seg = results[rep['start']:rep['end']+1]
+                if len(seg) < 2: continue
+                ys_r = [f['y'] for f in seg]
+                ts_r = [f['t'] for f in seg]
+                rom = abs(max(ys_r) - min(ys_r))  # normalised 0-1
+                vels = [abs(ys_r[i]-ys_r[i-1]) / max(ts_r[i]-ts_r[i-1], 0.001)
+                        for i in range(1, len(ys_r))]
+                rep_metrics.append({
+                    "start": rep['start'], "end": rep['end'],
+                    "rom": round(rom, 4),
+                    "mean_vel": round(float(np.mean(vels)), 4),
+                    "peak_vel": round(float(np.max(vels)), 4)
+                })
+
+            yield json.dumps({"done":True,"frames":results,"reps":rep_metrics,
+                              "cap_w":raw_w,"cap_h":raw_h,"fps":fps,"rotation":rot})+"\n"
         except Exception as e:
             yield json.dumps({"error":str(e)})+"\n"
         finally:
