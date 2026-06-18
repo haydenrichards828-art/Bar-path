@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="1.6.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="1.7.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -48,32 +48,68 @@ def hough_recover(gray, cx, cy, plate_r, wp, hp):
         result=hough_detect(gray,min_r,max_r,cx,cy,plate_r*scale)
         if result:
             rx,ry,rr=result
-            # Reject if returned radius is wildly inconsistent (found wrong object)
-            if 0.5*plate_r < rr < 1.8*plate_r:
-                return result
+            if 0.5*plate_r<rr<1.8*plate_r: return result
     return None
 
+def refine_center_radial(gray, cx, cy, r, n_rays=16):
+    """Sub-pixel center refinement using radial edge fitting.
+    Scans n_rays directions, finds the plate edge in each, fits a circle
+    to all edge points via least squares — gives the mathematical centre."""
+    h, w = gray.shape
+    eg = enhance(gray)
+    edge_pts = []
+    search = max(4, int(r * 0.18))  # search ±18% of radius along each ray
+
+    for i in range(n_rays):
+        angle = np.radians(i * 360.0 / n_rays)
+        dx = np.cos(angle); dy = np.sin(angle)
+        # Expected edge position at r * 0.95 (slightly inside rim for stability)
+        ex = cx + r * 0.95 * dx; ey = cy + r * 0.95 * dy
+        best_grad = 0; best_x = None; best_y = None
+        for d in range(-search, search + 1):
+            px = int(round(ex + d * dx)); py = int(round(ey + d * dy))
+            if 2 <= px < w-2 and 2 <= py < h-2:
+                # Gradient magnitude in the radial direction at this pixel
+                gx = float(eg[py, px+1]) - float(eg[py, px-1])
+                gy = float(eg[py+1, px]) - float(eg[py-1, px])
+                g = abs(gx * dx + gy * dy)
+                if g > best_grad:
+                    best_grad = g; best_x = px; best_y = py
+        if best_x is not None and best_grad > 8:
+            edge_pts.append((best_x, best_y))
+
+    if len(edge_pts) < 5:
+        return cx, cy  # not enough edges found, return unchanged
+
+    # Algebraic circle fit: x^2+y^2+Dx+Ey+F=0, centre=(-D/2,-E/2)
+    pts = np.array(edge_pts, dtype=np.float64)
+    xs, ys = pts[:,0], pts[:,1]
+    A = np.column_stack([xs, ys, np.ones(len(xs))])
+    b = -(xs**2 + ys**2)
+    try:
+        res, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        D, E, _ = res
+        ncx, ncy = -D/2.0, -E/2.0
+        # Accept only if refined centre is within 25% of radius from LK estimate
+        if (ncx - cx)**2 + (ncy - cy)**2 < (r * 0.25)**2:
+            return float(ncx), float(ncy)
+    except Exception:
+        pass
+    return cx, cy
+
 def seed_all_pts(gray, cx, cy, r):
-    """Interior Shi-Tomasi features + 60-point rim ring for maximum stability.
-    Rim points track the plate boundary directly — most stable under fast motion."""
     eg=enhance(gray)
     mask=np.zeros(gray.shape,np.uint8)
     cv2.circle(mask,(int(cx),int(cy)),int(max(4,r*0.88)),255,-1)
     interior=cv2.goodFeaturesToTrack(eg,200,0.004,3,mask=mask,blockSize=7)
-    # Rim ring: 60 evenly-spaced points at 0.92x radius
-    h,w=gray.shape
-    rim=[]
+    h,w=gray.shape; rim=[]
     for i in range(60):
-        a=np.radians(i*6)
-        px=cx+r*0.92*np.cos(a); py=cy+r*0.92*np.sin(a)
-        if 2<px<w-2 and 2<py<h-2:
-            rim.append([[px,py]])
+        a=np.radians(i*6); px=cx+r*0.92*np.cos(a); py=cy+r*0.92*np.sin(a)
+        if 2<px<w-2 and 2<py<h-2: rim.append([[px,py]])
     rim_arr=np.array(rim,dtype=np.float32) if rim else None
     if interior is not None and len(interior)>=6:
         return np.vstack([interior,rim_arr]) if rim_arr is not None else interior
-    # Fallback grid + rim
-    grid=[]
-    step=max(2.0,r*0.22); dy=-r*0.75
+    grid=[]; step=max(2.0,r*0.22); dy=-r*0.75
     while dy<=r*0.75:
         dx=-r*0.75
         while dx<=r*0.75:
@@ -128,7 +164,7 @@ def detect_reps(frames,min_frames=8):
 LK=dict(winSize=(31,31),maxLevel=4,criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT,30,0.01))
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"1.6.0"}
+def health(): return {"status":"ok","version":"1.7.0"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -164,6 +200,8 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             if det is None: det=hough_detect(g0,min_r,max_r,wp//2,hp//2,min(wp,hp)//2)
             if det is None: det=(tx,ty,max(min_r*2,int(hp*0.09)))
             cx,cy,plate_r=det; plate_r=max(min_r,plate_r)
+            # Initial radial refinement on frame 0
+            cx,cy=refine_center_radial(g0,cx,cy,plate_r)
             px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
             prev_gray=enhance(g0.copy()); p0=seed_all_pts(g0,cx,cy,plate_r); del g0
             kal=Kalman2D(cx,cy)
@@ -171,7 +209,6 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             yield json.dumps({"frame":results[0]})+"\n"
             frames_since_hough=0; MIN_FEATURES=30
             proc_every=max(1,round(fps/30.0))
-            # Velocity tracking for predictive Hough search
             pos_hist=[(cx,cy,0.0)]; vx=0.0; vy=0.0
             cap.set(cv2.CAP_PROP_POS_FRAMES,0); fn=0; proc=0
 
@@ -195,9 +232,11 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                         dxs=gn[:,0,0]-go[:,0,0]; dys=gn[:,0,1]-go[:,0,1]
                         raw_cx=float(np.clip(cx+float(np.median(dxs)),plate_r,wp-plate_r))
                         raw_cy=float(np.clip(cy+float(np.median(dys)),plate_r,hp-plate_r))
-                        cx,cy=kal.update(raw_cx,raw_cy)
+                        # Radial edge refinement: LK gives approximate position,
+                        # circle geometry gives exact centre
+                        refined_cx,refined_cy=refine_center_radial(curr_raw,raw_cx,raw_cy,plate_r)
+                        cx,cy=kal.update(refined_cx,refined_cy)
                         p0=gn.reshape(-1,1,2)
-                        # Update velocity estimate
                         pos_hist.append((cx,cy,t))
                         if len(pos_hist)>6: pos_hist.pop(0)
                         if len(pos_hist)>=3:
@@ -207,31 +246,30 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                     else:
                         rd=hough_recover(curr_raw,cx,cy,plate_r,wp,hp)
                         if rd:
-                            ncx,ncy,_=rd; cx,cy=kal.update(ncx,ncy)
+                            ncx,ncy,_=rd
+                            # Radial refinement on recovered position too
+                            ncx,ncy=refine_center_radial(curr_raw,ncx,ncy,plate_r)
+                            cx,cy=kal.update(ncx,ncy)
                             p0=seed_all_pts(curr_raw,cx,cy,plate_r); frames_since_hough=0
-                            vx=0.0; vy=0.0  # reset velocity after recovery
+                            vx=0.0; vy=0.0
 
-                    # Proactive replenishment
                     if len(p0)<MIN_FEATURES:
                         new_pts=seed_all_pts(curr_raw,cx,cy,plate_r)
                         if len(new_pts)>len(p0): p0=new_pts
 
-                    # Adaptive Hough re-anchor frequency based on bar speed
                     speed=np.sqrt(vx*vx+vy*vy)
                     hough_trigger=6 if speed>60 else (8 if speed>30 else 12)
-
                     frames_since_hough+=1
                     if frames_since_hough>=hough_trigger:
                         frames_since_hough=0
-                        # Predictive search: offset by expected displacement since last anchor
                         dt_pred=proc_every/fps*hough_trigger*0.5
                         pred_cx=float(np.clip(cx+vx*dt_pred,plate_r,wp-plate_r))
                         pred_cy=float(np.clip(cy+vy*dt_pred,plate_r,hp-plate_r))
                         rd=hough_detect(curr_raw,int(plate_r*0.65),int(plate_r*1.35),pred_cx,pred_cy,plate_r*2.5)
                         if rd:
                             ncx,ncy,rr=rd
-                            # Reject inconsistent radius
                             if 0.55*plate_r<rr<1.7*plate_r and (ncx-cx)**2+(ncy-cy)**2<(plate_r*2.0)**2:
+                                ncx,ncy=refine_center_radial(curr_raw,ncx,ncy,plate_r)
                                 cx,cy=kal.update(ncx,ncy)
                                 new_pts=seed_all_pts(curr_raw,cx,cy,plate_r)
                                 if len(new_pts)>=4: p0=new_pts
