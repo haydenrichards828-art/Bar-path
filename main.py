@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="2.2.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="2.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -45,7 +45,6 @@ def rotate_frame(frame, rot):
     return frame
 
 def enhance(gray):
-    """Enhanced gray — for Hough detection and feature seeding only, NOT for LK."""
     return CLAHE.apply(gray)
 
 def hough_detect(enh, min_r, max_r, cx_hint, cy_hint, search_pad):
@@ -71,7 +70,6 @@ def hough_recover(enh, cx, cy, plate_r):
     return None
 
 def refine_center_radial(enh, cx, cy, r, n_rays=16):
-    """Uses enhanced gray — better gradient visibility for edge detection."""
     h,w=enh.shape; edge_pts=[]; search=max(4,int(r*0.18))
     for i in range(n_rays):
         angle=np.radians(i*360.0/n_rays); dx=np.cos(angle); dy=np.sin(angle)
@@ -95,28 +93,30 @@ def refine_center_radial(enh, cx, cy, r, n_rays=16):
     except: pass
     return cx,cy
 
-def seed_pts(enh, cx, cy, r):
-    """Seed features from enhanced image — finds corners better.
-    Coordinates are in pixel space so they work with raw image for LK."""
-    mask=np.zeros(enh.shape,np.uint8)
-    cv2.circle(mask,(int(cx),int(cy)),int(max(4,r*0.80)),255,-1)
-    pts=cv2.goodFeaturesToTrack(enh,150,0.01,3,mask=mask,blockSize=7)
-    if pts is not None and len(pts)>=8: return pts
-    grid=[]; step=max(2.0,r*0.25); dy=-r*0.7
-    while dy<=r*0.7:
-        dx=-r*0.7
-        while dx<=r*0.7:
-            if dx*dx+dy*dy<=r*r*0.49: grid.append([[cx+dx,cy+dy]])
-            dx+=step
-        dy+=step
-    return np.array(grid,dtype=np.float32) if grid else np.array([[[cx,cy]]],dtype=np.float32)
-
-def filter_in_plate(p0, cx, cy, plate_r, margin=1.3):
-    pts=p0.reshape(-1,2)
-    dists=np.sqrt((pts[:,0]-cx)**2+(pts[:,1]-cy)**2)
-    keep=dists<plate_r*margin
-    if keep.sum()>=4: return p0[keep]
-    return p0
+def dense_flow_displacement(prev_raw, curr_raw, cx, cy, plate_r, wp, hp):
+    """Compute plate displacement using Farneback dense optical flow on the plate ROI.
+    Uses ALL pixels inside the plate circle — no feature drift possible."""
+    pad = int(plate_r * 1.6)
+    x0=max(0,int(cx)-pad); y0=max(0,int(cy)-pad)
+    x1=min(wp,int(cx)+pad); y1=min(hp,int(cy)+pad)
+    if x1-x0<10 or y1-y0<10: return 0.0, 0.0, False
+    roi_p=prev_raw[y0:y1,x0:x1]
+    roi_c=curr_raw[y0:y1,x0:x1]
+    try:
+        flow=cv2.calcOpticalFlowFarneback(
+            roi_p, roi_c, None,
+            pyr_scale=0.5, levels=3, winsize=15,
+            iterations=3, poly_n=5, poly_sigma=1.1, flags=0)
+    except: return 0.0, 0.0, False
+    h_roi,w_roi=roi_p.shape
+    cx_roi=cx-x0; cy_roi=cy-y0
+    Y,X=np.ogrid[:h_roi,:w_roi]
+    mask=(X-cx_roi)**2+(Y-cy_roi)**2 < (plate_r*0.85)**2
+    flow_pts=flow[mask]  # shape (N, 2)
+    if len(flow_pts)<20: return 0.0, 0.0, False
+    dx=float(np.median(flow_pts[:,0]))
+    dy=float(np.median(flow_pts[:,1]))
+    return dx, dy, True
 
 def smooth_coords(xs,ys,window=5):
     if len(xs)<window: return xs,ys
@@ -145,12 +145,8 @@ def detect_reps(frames,min_frames=8):
         else: i+=1
     return merged
 
-# LK runs on RAW frames — brightness constancy must hold between frames
-LK=dict(winSize=(21,21),maxLevel=3,
-    criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT,20,0.01))
-
 @app.get("/health")
-def health(): return {"status":"ok","version":"2.2.0"}
+def health(): return {"status":"ok","version":"2.3.0"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -188,12 +184,10 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             cx,cy,plate_r=det; plate_r=max(min_r,plate_r)
             cx,cy=refine_center_radial(enh0,cx,cy,plate_r)
             px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
-            # LK tracks raw frames — no CLAHE contamination
-            prev_raw=raw0.copy()
-            p0=seed_pts(enh0,cx,cy,plate_r); del raw0,enh0
+            prev_raw=raw0.copy(); del raw0,enh0
             results=[{"t":0.0,"x":round(cx/wp,5),"y":round(cy/hp,5)}]
             yield json.dumps({"frame":results[0]})+"\n"
-            frames_since_hough=0; HOUGH_EVERY=10; MIN_FEATURES=30
+            frames_since_hough=0; HOUGH_EVERY=10
             cap.set(cv2.CAP_PROP_POS_FRAMES,0); fn=0; last_t=0.0
 
             while True:
@@ -201,38 +195,29 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 if not ret: break
                 frame=rotate_frame(frame,rot)
                 curr_raw=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY); del frame
-                curr_enh=enhance(curr_raw)  # enhanced only for Hough/refine
+                curr_enh=enhance(curr_raw)
                 msec_t=cap.get(cv2.CAP_PROP_POS_MSEC)/1000.0
                 t=msec_t if msec_t>last_t else fn/fps
 
-                # LK on RAW frames — brightness constancy preserved
-                p1,sf,_=cv2.calcOpticalFlowPyrLK(prev_raw,curr_raw,p0,None,**LK)
-                p0r,sb,_=cv2.calcOpticalFlowPyrLK(curr_raw,prev_raw,p1,None,**LK)
-                fb=np.abs(p0-p0r).reshape(-1,2).max(axis=1)
-                good=(sf.ravel()==1)&(sb.ravel()==1)&(fb<2.0)
+                # Dense Farneback on plate ROI — every pixel inside plate circle votes
+                dx,dy,ok=dense_flow_displacement(prev_raw,curr_raw,cx,cy,plate_r,wp,hp)
 
-                if good.sum()>=4:
-                    gn=p1[good]; go=p0[good]
-                    raw_cx=cx+float(np.median(gn[:,0,0]-go[:,0,0]))
-                    raw_cy=cy+float(np.median(gn[:,0,1]-go[:,0,1]))
-                    raw_cx=float(np.clip(raw_cx,plate_r,wp-plate_r))
-                    raw_cy=float(np.clip(raw_cy,plate_r,hp-plate_r))
-                    # Refine with enhanced frame for precise edge detection
+                if ok:
+                    raw_cx=cx+dx
+                    raw_cy=cy+dy
+                    # Allow center to go near frame edges (only clip at absolute boundary)
+                    raw_cx=float(np.clip(raw_cx,5,wp-5))
+                    raw_cy=float(np.clip(raw_cy,5,hp-5))
                     cx,cy=refine_center_radial(curr_enh,raw_cx,raw_cy,plate_r)
-                    p0=gn.reshape(-1,1,2)
-                    # Remove features that drifted off the plate
-                    p0=filter_in_plate(p0,cx,cy,plate_r,margin=1.3)
                 else:
+                    # Dense flow failed — try Hough recovery
                     rd=hough_recover(curr_enh,cx,cy,plate_r)
                     if rd:
                         ncx,ncy,_=rd
                         cx,cy=refine_center_radial(curr_enh,ncx,ncy,plate_r)
-                        p0=seed_pts(curr_enh,cx,cy,plate_r); frames_since_hough=0
+                        frames_since_hough=0
 
-                if len(p0)<MIN_FEATURES:
-                    new_pts=seed_pts(curr_enh,cx,cy,plate_r)
-                    if len(new_pts)>len(p0): p0=new_pts
-
+                # Periodic Hough re-anchor to correct slow drift
                 frames_since_hough+=1
                 if frames_since_hough>=HOUGH_EVERY:
                     frames_since_hough=0
@@ -243,7 +228,6 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                             cx,cy=refine_center_radial(curr_enh,ncx,ncy,plate_r)
                             plate_r=plate_r*0.92+rr*0.08
                             px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
-                            p0=seed_pts(curr_enh,cx,cy,plate_r)
 
                 del curr_enh
                 frame_data={"t":round(t,4),"x":round(cx/wp,5),"y":round(cy/hp,5)}
