@@ -3,15 +3,13 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="1.5.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="1.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
 SCALE            = 1.0
-CLAHE            = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-FB_THRESHOLD     = 2.0   # Raised from 1.5 — full-res 1080p naturally has higher FB error
-MIN_FEATURES     = 30    # Replenish before we get low, not after we're already struggling
-HOUGH_EVERY      = 10
+CLAHE            = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+FB_THRESHOLD     = 2.0
 
 def get_rotation(path):
     try:
@@ -32,69 +30,82 @@ def enhance(gray):
 
 def hough_detect(gray, min_r, max_r, cx_hint, cy_hint, search_pad):
     h, w = gray.shape
-    sx = max(0, int(cx_hint-search_pad)); sy = max(0, int(cy_hint-search_pad))
-    ex = min(w, int(cx_hint+search_pad)); ey = min(h, int(cy_hint+search_pad))
-    if ex-sx < 10 or ey-sy < 10: return None
-    roi = enhance(gray[sy:ey, sx:ex])
-    b = cv2.GaussianBlur(roi, (9,9), 2)
-    for p2 in [30, 24, 18, 12, 8, 5]:
-        c = cv2.HoughCircles(b, cv2.HOUGH_GRADIENT, 1.2, (ey-sy)//2,
-            param1=80, param2=p2, minRadius=min_r, maxRadius=max_r)
+    sx=max(0,int(cx_hint-search_pad)); sy=max(0,int(cy_hint-search_pad))
+    ex=min(w,int(cx_hint+search_pad)); ey=min(h,int(cy_hint+search_pad))
+    if ex-sx<10 or ey-sy<10: return None
+    roi=enhance(gray[sy:ey,sx:ex])
+    b=cv2.GaussianBlur(roi,(9,9),2)
+    for p2 in [30,24,18,12,8,5]:
+        c=cv2.HoughCircles(b,cv2.HOUGH_GRADIENT,1.2,(ey-sy)//2,param1=80,param2=p2,minRadius=min_r,maxRadius=max_r)
         if c is not None:
-            best = min(c[0], key=lambda v: (v[0]+sx-cx_hint)**2+(v[1]+sy-cy_hint)**2)
-            return float(best[0]+sx), float(best[1]+sy), float(best[2])
+            best=min(c[0],key=lambda v:(v[0]+sx-cx_hint)**2+(v[1]+sy-cy_hint)**2)
+            return float(best[0]+sx),float(best[1]+sy),float(best[2])
     return None
 
 def hough_recover(gray, cx, cy, plate_r, wp, hp):
-    """Progressive Hough search — widens radius until plate found or gives up."""
-    min_r = int(plate_r*0.5); max_r = int(plate_r*1.5)
-    for scale in [2.2, 3.5, 5.0, 7.0]:
-        result = hough_detect(gray, min_r, max_r, cx, cy, plate_r*scale)
+    min_r=int(plate_r*0.5); max_r=int(plate_r*1.5)
+    for scale in [2.2,3.5,5.0,7.0]:
+        result=hough_detect(gray,min_r,max_r,cx,cy,plate_r*scale)
         if result:
-            return result
+            rx,ry,rr=result
+            # Reject if returned radius is wildly inconsistent (found wrong object)
+            if 0.5*plate_r < rr < 1.8*plate_r:
+                return result
     return None
 
-def seed_pts(gray, cx, cy, r):
-    eg = enhance(gray)
-    mask = np.zeros(gray.shape, np.uint8)
-    cv2.circle(mask, (int(cx), int(cy)), int(max(4, r*0.88)), 255, -1)
-    pts = cv2.goodFeaturesToTrack(eg, 150, 0.005, 3, mask=mask, blockSize=7)
-    if pts is not None and len(pts) >= 6: return pts
-    grid = []; step = max(2.0, r*0.22); dy = -r*0.75
-    while dy <= r*0.75:
-        dx = -r*0.75
-        while dx <= r*0.75:
-            if dx*dx+dy*dy <= r*r*0.56: grid.append([[cx+dx, cy+dy]])
-            dx += step
-        dy += step
-    return np.array(grid, dtype=np.float32) if grid else np.array([[[cx,cy]]], dtype=np.float32)
+def seed_all_pts(gray, cx, cy, r):
+    """Interior Shi-Tomasi features + 60-point rim ring for maximum stability.
+    Rim points track the plate boundary directly — most stable under fast motion."""
+    eg=enhance(gray)
+    mask=np.zeros(gray.shape,np.uint8)
+    cv2.circle(mask,(int(cx),int(cy)),int(max(4,r*0.88)),255,-1)
+    interior=cv2.goodFeaturesToTrack(eg,200,0.004,3,mask=mask,blockSize=7)
+    # Rim ring: 60 evenly-spaced points at 0.92x radius
+    h,w=gray.shape
+    rim=[]
+    for i in range(60):
+        a=np.radians(i*6)
+        px=cx+r*0.92*np.cos(a); py=cy+r*0.92*np.sin(a)
+        if 2<px<w-2 and 2<py<h-2:
+            rim.append([[px,py]])
+    rim_arr=np.array(rim,dtype=np.float32) if rim else None
+    if interior is not None and len(interior)>=6:
+        return np.vstack([interior,rim_arr]) if rim_arr is not None else interior
+    # Fallback grid + rim
+    grid=[]
+    step=max(2.0,r*0.22); dy=-r*0.75
+    while dy<=r*0.75:
+        dx=-r*0.75
+        while dx<=r*0.75:
+            if dx*dx+dy*dy<=r*r*0.56: grid.append([[cx+dx,cy+dy]])
+            dx+=step
+        dy+=step
+    base=np.array(grid,dtype=np.float32) if grid else np.array([[[cx,cy]]],dtype=np.float32)
+    return np.vstack([base,rim_arr]) if rim_arr is not None else base
 
 class Kalman2D:
-    """Position + velocity Kalman — smooths LK noise on good frames only."""
-    def __init__(self, x0, y0):
-        self.kf = cv2.KalmanFilter(4, 2)
-        self.kf.measurementMatrix   = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
-        self.kf.transitionMatrix    = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], np.float32)
-        self.kf.processNoiseCov     = np.eye(4, dtype=np.float32) * 0.05
-        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 2.0
-        self.kf.statePre  = np.array([[x0],[y0],[0.0],[0.0]], np.float32)
-        self.kf.statePost = np.array([[x0],[y0],[0.0],[0.0]], np.float32)
-    def update(self, x, y):
+    def __init__(self,x0,y0):
+        self.kf=cv2.KalmanFilter(4,2)
+        self.kf.measurementMatrix=np.array([[1,0,0,0],[0,1,0,0]],np.float32)
+        self.kf.transitionMatrix=np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]],np.float32)
+        self.kf.processNoiseCov=np.eye(4,dtype=np.float32)*0.05
+        self.kf.measurementNoiseCov=np.eye(2,dtype=np.float32)*2.0
+        self.kf.statePre=np.array([[x0],[y0],[0.0],[0.0]],np.float32)
+        self.kf.statePost=np.array([[x0],[y0],[0.0],[0.0]],np.float32)
+    def update(self,x,y):
         self.kf.predict()
-        corr = self.kf.correct(np.array([[x],[y]], np.float32))
-        return float(corr[0]), float(corr[1])
-    # No predict_only — we never invent a position we don't have evidence for
+        corr=self.kf.correct(np.array([[x],[y]],np.float32))
+        return float(corr[0]),float(corr[1])
 
-def smooth_coords(xs, ys, window=7):
-    if len(xs) < window: return xs, ys
-    w = window if window % 2 == 1 else window+1
-    k = np.ones(w)/w
+def smooth_coords(xs,ys,window=7):
+    if len(xs)<window: return xs,ys
+    w=window if window%2==1 else window+1; k=np.ones(w)/w
     xs_s=np.convolve(xs,k,mode='same'); ys_s=np.convolve(ys,k,mode='same')
     h=w//2; xs_s[:h]=xs[:h]; xs_s[-h:]=xs[-h:]; ys_s[:h]=ys[:h]; ys_s[-h:]=ys[-h:]
-    return xs_s.tolist(), ys_s.tolist()
+    return xs_s.tolist(),ys_s.tolist()
 
-def detect_reps(frames, min_frames=8):
-    if len(frames) < min_frames*2: return []
+def detect_reps(frames,min_frames=8):
+    if len(frames)<min_frames*2: return []
     ys=[f['y'] for f in frames]; ts=[f['t'] for f in frames]
     vel=[(ys[i]-ys[i-1])/max(ts[i]-ts[i-1],0.001) for i in range(1,len(ys))]
     vel=[vel[0]]+vel
@@ -114,54 +125,54 @@ def detect_reps(frames, min_frames=8):
         else: i+=1
     return merged
 
-LK = dict(winSize=(31,31), maxLevel=4,
-    criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+LK=dict(winSize=(31,31),maxLevel=4,criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT,30,0.01))
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"1.5.0"}
+def health(): return {"status":"ok","version":"1.6.0"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
-    tmp = tempfile.mktemp(suffix=".mp4")
+    tmp=tempfile.mktemp(suffix=".mp4")
     try:
-        data = await video.read()
-        if len(data) > 600*1024*1024: raise HTTPException(400, "Video too large")
+        data=await video.read()
+        if len(data)>600*1024*1024: raise HTTPException(400,"Video too large")
         with open(tmp,"wb") as f: f.write(data)
         del data
     except HTTPException: raise
-    except Exception as e: raise HTTPException(500, f"Save failed: {e}")
+    except Exception as e: raise HTTPException(500,f"Save failed: {e}")
 
     async def stream():
         try:
-            rot = get_rotation(tmp)
-            cap = cv2.VideoCapture(tmp)
+            rot=get_rotation(tmp)
+            cap=cv2.VideoCapture(tmp)
             if not cap.isOpened(): yield json.dumps({"error":"Cannot open video"})+"\n"; return
-            fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            ret, f0 = cap.read()
+            fps=cap.get(cv2.CAP_PROP_FPS) or 30.0
+            total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            ret,f0=cap.read()
             if not ret: yield json.dumps({"error":"Cannot read first frame"})+"\n"; return
-            f0 = rotate_frame(f0, rot)
-            raw_h, raw_w = f0.shape[:2]
-            wp = int(raw_w*SCALE); hp = int(raw_h*SCALE)
-            f0s = f0 if SCALE==1.0 else cv2.resize(f0,(wp,hp))
-            g0  = cv2.cvtColor(f0s, cv2.COLOR_BGR2GRAY)
-            del f0, f0s
-            try: p = json.loads(params)
-            except: p = {}
-            tx = float(p.get("start_x",0.5))*wp; ty = float(p.get("start_y",0.5))*hp
+            f0=rotate_frame(f0,rot)
+            raw_h,raw_w=f0.shape[:2]
+            wp=int(raw_w*SCALE); hp=int(raw_h*SCALE)
+            f0s=f0 if SCALE==1.0 else cv2.resize(f0,(wp,hp))
+            g0=cv2.cvtColor(f0s,cv2.COLOR_BGR2GRAY); del f0,f0s
+            try: p=json.loads(params)
+            except: p={}
+            tx=float(p.get("start_x",0.5))*wp; ty=float(p.get("start_y",0.5))*hp
             min_r=max(10,int(hp*0.05)); max_r=min(wp//2,int(hp*0.47))
             pad=int(min(wp,hp)*0.35)
-            det = hough_detect(g0,min_r,max_r,tx,ty,pad)
-            if det is None: det = hough_detect(g0,min_r,max_r,wp//2,hp//2,min(wp,hp)//2)
-            if det is None: det = (tx,ty,max(min_r*2,int(hp*0.09)))
+            det=hough_detect(g0,min_r,max_r,tx,ty,pad)
+            if det is None: det=hough_detect(g0,min_r,max_r,wp//2,hp//2,min(wp,hp)//2)
+            if det is None: det=(tx,ty,max(min_r*2,int(hp*0.09)))
             cx,cy,plate_r=det; plate_r=max(min_r,plate_r)
             px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
-            prev_gray=enhance(g0.copy()); p0=seed_pts(g0,cx,cy,plate_r); del g0
+            prev_gray=enhance(g0.copy()); p0=seed_all_pts(g0,cx,cy,plate_r); del g0
             kal=Kalman2D(cx,cy)
             results=[{"t":0.0,"x":round(cx/wp,5),"y":round(cy/hp,5)}]
             yield json.dumps({"frame":results[0]})+"\n"
-            frames_since_hough=0
-            proc_every=max(1,round(fps/30.0))  # 60fps→every 2nd, 30fps→every frame
+            frames_since_hough=0; MIN_FEATURES=30
+            proc_every=max(1,round(fps/30.0))
+            # Velocity tracking for predictive Hough search
+            pos_hist=[(cx,cy,0.0)]; vx=0.0; vy=0.0
             cap.set(cv2.CAP_PROP_POS_FRAMES,0); fn=0; proc=0
 
             while True:
@@ -174,7 +185,6 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 curr_gray=enhance(curr_raw)
 
                 if fn%proc_every==0:
-                    # ── Bidirectional LK ──────────────────────────────────
                     p1,sf,_=cv2.calcOpticalFlowPyrLK(prev_gray,curr_gray,p0,None,**LK)
                     p0r,sb,_=cv2.calcOpticalFlowPyrLK(curr_gray,prev_gray,p1,None,**LK)
                     fb=np.abs(p0-p0r).reshape(-1,2).max(axis=1)
@@ -182,36 +192,48 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
 
                     if good.sum()>=4:
                         gn=p1[good]; go=p0[good]
-                        raw_cx=float(np.clip(cx+float(np.median(gn[:,0,0]-go[:,0,0])),plate_r,wp-plate_r))
-                        raw_cy=float(np.clip(cy+float(np.median(gn[:,0,1]-go[:,0,1])),plate_r,hp-plate_r))
+                        dxs=gn[:,0,0]-go[:,0,0]; dys=gn[:,0,1]-go[:,0,1]
+                        raw_cx=float(np.clip(cx+float(np.median(dxs)),plate_r,wp-plate_r))
+                        raw_cy=float(np.clip(cy+float(np.median(dys)),plate_r,hp-plate_r))
                         cx,cy=kal.update(raw_cx,raw_cy)
                         p0=gn.reshape(-1,1,2)
+                        # Update velocity estimate
+                        pos_hist.append((cx,cy,t))
+                        if len(pos_hist)>6: pos_hist.pop(0)
+                        if len(pos_hist)>=3:
+                            dt=max(pos_hist[-1][2]-pos_hist[-3][2],0.001)
+                            vx=(pos_hist[-1][0]-pos_hist[-3][0])/dt
+                            vy=(pos_hist[-1][1]-pos_hist[-3][1])/dt
                     else:
-                        # LK failed — progressive Hough recovery, no prediction
                         rd=hough_recover(curr_raw,cx,cy,plate_r,wp,hp)
                         if rd:
-                            ncx,ncy,_=rd
-                            cx,cy=kal.update(ncx,ncy)
-                            p0=seed_pts(curr_raw,cx,cy,plate_r)
-                            frames_since_hough=0
-                        # else: hold cx,cy — no fake movement
+                            ncx,ncy,_=rd; cx,cy=kal.update(ncx,ncy)
+                            p0=seed_all_pts(curr_raw,cx,cy,plate_r); frames_since_hough=0
+                            vx=0.0; vy=0.0  # reset velocity after recovery
 
-                    # ── Proactive feature replenishment ───────────────────
-                    # Refill BEFORE features get critically low
+                    # Proactive replenishment
                     if len(p0)<MIN_FEATURES:
-                        new_pts=seed_pts(curr_raw,cx,cy,plate_r)
+                        new_pts=seed_all_pts(curr_raw,cx,cy,plate_r)
                         if len(new_pts)>len(p0): p0=new_pts
 
-                    # ── Scheduled Hough re-anchor ─────────────────────────
+                    # Adaptive Hough re-anchor frequency based on bar speed
+                    speed=np.sqrt(vx*vx+vy*vy)
+                    hough_trigger=6 if speed>60 else (8 if speed>30 else 12)
+
                     frames_since_hough+=1
-                    if frames_since_hough>=HOUGH_EVERY:
+                    if frames_since_hough>=hough_trigger:
                         frames_since_hough=0
-                        rd=hough_detect(curr_raw,int(plate_r*0.65),int(plate_r*1.35),cx,cy,plate_r*2.8)
+                        # Predictive search: offset by expected displacement since last anchor
+                        dt_pred=proc_every/fps*hough_trigger*0.5
+                        pred_cx=float(np.clip(cx+vx*dt_pred,plate_r,wp-plate_r))
+                        pred_cy=float(np.clip(cy+vy*dt_pred,plate_r,hp-plate_r))
+                        rd=hough_detect(curr_raw,int(plate_r*0.65),int(plate_r*1.35),pred_cx,pred_cy,plate_r*2.5)
                         if rd:
-                            ncx,ncy,_=rd
-                            if (ncx-cx)**2+(ncy-cy)**2<(plate_r*2.0)**2:
+                            ncx,ncy,rr=rd
+                            # Reject inconsistent radius
+                            if 0.55*plate_r<rr<1.7*plate_r and (ncx-cx)**2+(ncy-cy)**2<(plate_r*2.0)**2:
                                 cx,cy=kal.update(ncx,ncy)
-                                new_pts=seed_pts(curr_raw,cx,cy,plate_r)
+                                new_pts=seed_all_pts(curr_raw,cx,cy,plate_r)
                                 if len(new_pts)>=4: p0=new_pts
 
                     frame_data={"t":round(t,4),"x":round(cx/wp,5),"y":round(cy/hp,5)}
@@ -247,4 +269,4 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             try: os.unlink(tmp)
             except: pass
 
-    return StreamingResponse(stream(), media_type="application/x-ndjson")
+    return StreamingResponse(stream(),media_type="application/x-ndjson")
