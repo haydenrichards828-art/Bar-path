@@ -3,10 +3,12 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="1.2.1")
+app = FastAPI(title="ForceTrack Bar Path API", version="1.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-PLATE_DIAMETER_M = 0.450  # Standard Olympic plate — 10kg and above are all 450mm
+PLATE_DIAMETER_M = 0.450  # Standard Olympic plate — 10kg+ all 450mm
+SCALE = 0.65              # Process at 65% resolution for better feature density
+CLAHE = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))  # Local contrast enhancement
 
 def get_rotation(path):
     try:
@@ -20,12 +22,16 @@ def rotate_frame(frame, rot):
     if rot == 270: return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     return frame
 
+def enhance(gray):
+    """CLAHE: boosts local contrast so dark plate edges stand out against dark background."""
+    return CLAHE.apply(gray)
+
 def hough_detect(gray, min_r, max_r, cx_hint, cy_hint, search_pad):
     h, w = gray.shape
     sx = max(0, int(cx_hint-search_pad)); sy = max(0, int(cy_hint-search_pad))
     ex = min(w, int(cx_hint+search_pad)); ey = min(h, int(cy_hint+search_pad))
     if ex-sx < 10 or ey-sy < 10: return None
-    roi = gray[sy:ey, sx:ex]
+    roi = enhance(gray[sy:ey, sx:ex])  # enhance before Hough
     b = cv2.GaussianBlur(roi, (9,9), 2)
     for p2 in [30, 24, 18, 12, 8, 5]:
         c = cv2.HoughCircles(b, cv2.HOUGH_GRADIENT, 1.2, (ey-sy)//2, param1=80, param2=p2, minRadius=min_r, maxRadius=max_r)
@@ -35,9 +41,10 @@ def hough_detect(gray, min_r, max_r, cx_hint, cy_hint, search_pad):
     return None
 
 def seed_pts(gray, cx, cy, r):
+    eg = enhance(gray)  # enhanced gray for feature detection
     mask = np.zeros(gray.shape, np.uint8)
     cv2.circle(mask, (int(cx), int(cy)), int(max(4, r*0.88)), 255, -1)
-    pts = cv2.goodFeaturesToTrack(gray, 120, 0.008, 3, mask=mask, blockSize=7)
+    pts = cv2.goodFeaturesToTrack(eg, 120, 0.008, 3, mask=mask, blockSize=7)
     if pts is not None and len(pts) >= 6: return pts
     grid = []; step = max(2.0, r*0.22); dy = -r*0.75
     while dy <= r*0.75:
@@ -83,7 +90,7 @@ def detect_reps(frames, min_frames=8):
 LK = dict(winSize=(31,31), maxLevel=4, criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT, 30, 0.01))
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"1.2.1"}
+def health(): return {"status":"ok","version":"1.3.0"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -107,7 +114,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             if not ret: yield json.dumps({"error":"Cannot read first frame"})+"\n"; return
             f0 = rotate_frame(f0, rot)
             raw_h, raw_w = f0.shape[:2]
-            wp, hp = int(raw_w*0.5), int(raw_h*0.5)
+            wp, hp = int(raw_w*SCALE), int(raw_h*SCALE)
             f0s = cv2.resize(f0, (wp, hp)); g0 = cv2.cvtColor(f0s, cv2.COLOR_BGR2GRAY)
             del f0, f0s
             try: p = json.loads(params)
@@ -119,10 +126,13 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             if det is None: det = hough_detect(g0, min_r, max_r, wp//2, hp//2, min(wp,hp)//2)
             if det is None: det = (tx, ty, max(min_r*2, int(hp*0.09)))
             cx, cy, plate_r = det; plate_r = max(min_r, plate_r)
-            # Scale factor: plate_r pixels = half of 450mm = 225mm
             px_per_m = plate_r / (PLATE_DIAMETER_M / 2.0)
-            prev_gray = g0.copy(); p0 = seed_pts(g0, cx, cy, plate_r); del g0
-            results = []; frames_since_hough = 0; HOUGH_EVERY = 10
+            # Keep prev_gray as enhanced for LK (better gradient tracking)
+            prev_gray = enhance(g0.copy())
+            p0 = seed_pts(g0, cx, cy, plate_r); del g0
+            results = [{"t":0.0,"x":round(cx/wp,5),"y":round(cy/hp,5)}]
+            yield json.dumps({"frame":results[0]})+"\n"
+            frames_since_hough = 0; HOUGH_EVERY = 10
             proc_every = max(1, total // 600)
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0); fn = 0; proc = 0
             while True:
@@ -130,7 +140,8 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 if not ret: break
                 frame = rotate_frame(frame, rot); small = cv2.resize(frame, (wp, hp))
                 t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0; del frame
-                curr_gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY); del small
+                curr_raw = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY); del small
+                curr_gray = enhance(curr_raw)  # CLAHE on every frame
                 if fn % proc_every == 0:
                     p1, sf, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, p0, None, **LK)
                     p0r, sb, _ = cv2.calcOpticalFlowPyrLK(curr_gray, prev_gray, p1, None, **LK)
@@ -138,35 +149,39 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                     good = (sf.ravel()==1)&(sb.ravel()==1)&(fb<1.5)
                     if good.sum() >= 4:
                         gn = p1[good]; go = p0[good]
-                        cx = float(np.clip(cx+float(np.median(gn[:,0,0]-go[:,0,0])), plate_r, wp-plate_r))
-                        cy = float(np.clip(cy+float(np.median(gn[:,0,1]-go[:,0,1])), plate_r, hp-plate_r))
+                        dxs = gn[:,0,0]-go[:,0,0]; dys = gn[:,0,1]-go[:,0,1]
+                        cx = float(np.clip(cx+float(np.median(dxs)), plate_r, wp-plate_r))
+                        cy = float(np.clip(cy+float(np.median(dys)), plate_r, hp-plate_r))
                         p0 = gn.reshape(-1,1,2)
                     if good.sum() < 8:
-                        rd = hough_detect(curr_gray, int(plate_r*0.65), int(plate_r*1.35), cx, cy, plate_r*2.2)
+                        rd = hough_detect(curr_raw, int(plate_r*0.65), int(plate_r*1.35), cx, cy, plate_r*2.2)
                         if rd:
                             ncx, ncy, _ = rd
                             if (ncx-cx)**2+(ncy-cy)**2 < (plate_r*1.6)**2:
                                 cx, cy = ncx, ncy
-                                np_ = seed_pts(curr_gray, cx, cy, plate_r)
+                                np_ = seed_pts(curr_raw, cx, cy, plate_r)
                                 if len(np_) >= 4: p0 = np_; frames_since_hough = 0
                     frames_since_hough += 1
                     if frames_since_hough >= HOUGH_EVERY:
                         frames_since_hough = 0
-                        rd = hough_detect(curr_gray, int(plate_r*0.65), int(plate_r*1.35), cx, cy, plate_r*2.8)
+                        rd = hough_detect(curr_raw, int(plate_r*0.65), int(plate_r*1.35), cx, cy, plate_r*2.8)
                         if rd:
                             ncx, ncy, _ = rd
                             if (ncx-cx)**2+(ncy-cy)**2 < (plate_r*2.0)**2:
                                 cx, cy = ncx, ncy
-                                np_ = seed_pts(curr_gray, cx, cy, plate_r)
+                                np_ = seed_pts(curr_raw, cx, cy, plate_r)
                                 if len(np_) >= 4: p0 = np_
-                    results.append({"t":round(t,4),"x":round(cx/wp,5),"y":round(cy/hp,5)})
+                    frame_data = {"t":round(t,4),"x":round(cx/wp,5),"y":round(cy/hp,5)}
+                    results.append(frame_data)
+                    # Stream each frame result as computed
+                    yield json.dumps({"frame": frame_data})+"\n"
                     proc += 1
                     if proc % 30 == 0:
-                        pct = min(99, int(fn/max(total,1)*100))
-                        yield json.dumps({"progress":pct})+"\n"
-                        await asyncio.sleep(0)
-                prev_gray = curr_gray; fn += 1
+                        await asyncio.sleep(0)  # yield control to event loop
+                prev_gray = curr_gray
+                fn += 1
             cap.release()
+            # Post-process
             if results:
                 xs = np.array([f['x'] for f in results]); ys = np.array([f['y'] for f in results])
                 xs_s, ys_s = smooth_coords(xs.tolist(), ys.tolist(), window=9)
@@ -177,20 +192,10 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 seg = results[rep['start']:rep['end']+1]
                 if len(seg) < 2: continue
                 ys_r = [f['y'] for f in seg]; ts_r = [f['t'] for f in seg]
-                # ROM in metres: vertical displacement in normalised units * hp pixels / px_per_m
-                rom_px = abs(max(ys_r) - min(ys_r)) * hp
-                rom_m  = rom_px / px_per_m
-                # Velocity in m/s: pixel displacement per second / px_per_m
-                vels_ms = [abs(ys_r[i]-ys_r[i-1]) * hp / max(ts_r[i]-ts_r[i-1],0.001) / px_per_m
-                           for i in range(1, len(ys_r))]
-                rep_metrics.append({
-                    "start": rep['start'], "end": rep['end'],
-                    "rom_m":    round(rom_m, 3),
-                    "mean_ms":  round(float(np.mean(vels_ms)), 3),
-                    "peak_ms":  round(float(np.max(vels_ms)),  3)
-                })
-            yield json.dumps({"done":True,"frames":results,"reps":rep_metrics,
-                              "cap_w":raw_w,"cap_h":raw_h,"fps":fps,"rotation":rot,"px_per_m":round(px_per_m,2)})+"\n"
+                rom_m = abs(max(ys_r)-min(ys_r)) * hp / px_per_m
+                vels_ms = [abs(ys_r[i]-ys_r[i-1])*hp/max(ts_r[i]-ts_r[i-1],0.001)/px_per_m for i in range(1,len(ys_r))]
+                rep_metrics.append({"start":rep['start'],"end":rep['end'],"rom_m":round(rom_m,3),"mean_ms":round(float(np.mean(vels_ms)),3),"peak_ms":round(float(np.max(vels_ms)),3)})
+            yield json.dumps({"done":True,"frames":results,"reps":rep_metrics,"cap_w":raw_w,"cap_h":raw_h,"fps":fps,"rotation":rot,"px_per_m":round(px_per_m,2)})+"\n"
         except Exception as e:
             yield json.dumps({"error":str(e)})+"\n"
         finally:
