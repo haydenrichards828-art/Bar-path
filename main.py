@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="3.0.2")
+app = FastAPI(title="ForceTrack Bar Path API", version="3.0.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -65,13 +65,16 @@ def make_template(proc_gray, cx, cy, tpad):
     if x1-x0<10 or y1-y0<10: return None,None,tpad
     patch=proc_gray[y0:y1,x0:x1].copy()
     actual_hx=int(cx)-x0; actual_hy=int(cy)-y0
-    # Circular mask — only plate pixels count, background ignored
     mask=np.zeros(patch.shape,dtype=np.uint8)
     r=int(min(actual_hx,actual_hy)*0.90)
     cv2.circle(mask,(actual_hx,actual_hy),max(4,r),255,-1)
     return patch,mask,(actual_hx,actual_hy)
 
 def template_match(proc_gray, tmpl, tmpl_mask, half_wh, cx, cy, search_r):
+    """SQDIFF_NORMED with mask — the reliable, well-supported masked-matching
+    combo in OpenCV. Lower score = better match (0 = perfect). Unlike CCORR_NORMED,
+    SQDIFF is shape/texture-sensitive and won't be fooled by flat dark regions
+    (floor, shadows, rack uprights) that happen to be similar average brightness."""
     if tmpl is None: return None
     th,tw=tmpl.shape; h,w=proc_gray.shape
     hx,hy=half_wh
@@ -82,17 +85,13 @@ def template_match(proc_gray, tmpl, tmpl_mask, half_wh, cx, cy, search_r):
     if ex<=sx or ey<=sy: return None
     region=proc_gray[sy:ey+th, sx:ex+tw]
     if region.shape[0]<th or region.shape[1]<tw: return None
-    try:
-        # Masked matching: only plate pixels inside circle contribute
-        # TM_CCORR_NORMED required for mask support
-        result=cv2.matchTemplate(region,tmpl,cv2.TM_CCORR_NORMED,mask=tmpl_mask)
-    except:
-        result=cv2.matchTemplate(region,tmpl,cv2.TM_CCOEFF_NORMED)
-    _,max_val,_,max_loc=cv2.minMaxLoc(result)
-    if max_val<0.50: return None  # Higher threshold for CCORR_NORMED (range is tighter)
-    ncx=float(sx+max_loc[0]+hx)
-    ncy=float(sy+max_loc[1]+hy)
-    return ncx,ncy,max_val
+    result=cv2.matchTemplate(region,tmpl,cv2.TM_SQDIFF_NORMED,mask=tmpl_mask)
+    min_val,_,min_loc,_=cv2.minMaxLoc(result)
+    if min_val>0.35: return None  # lower=better; reject poor matches
+    ncx=float(sx+min_loc[0]+hx)
+    ncy=float(sy+min_loc[1]+hy)
+    confidence=1.0-min_val
+    return ncx,ncy,confidence
 
 def smooth_coords(xs,ys,window=5):
     if len(xs)<window: return xs,ys
@@ -122,7 +121,7 @@ def detect_reps(frames,min_frames=8):
     return merged
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"3.0.2"}
+def health(): return {"status":"ok","version":"3.0.3"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -184,12 +183,11 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                     ncx,ncy,conf=match
                     cx,cy=ncx,ncy
                     frames_since_update+=1
-                    if frames_since_update>=UPDATE_EVERY and conf>0.60:
+                    if frames_since_update>=UPDATE_EVERY and conf>0.70:
                         frames_since_update=0
                         new_tmpl,new_mask,_=make_template(pg,cx,cy,tpad)
                         if new_tmpl is not None and new_tmpl.shape==tmpl.shape:
                             tmpl=cv2.addWeighted(tmpl,0.4,new_tmpl,0.6,0)
-                            # Mask stays fixed — always the same circle shape
 
                 del pg,gray
                 frame_data={"t":round(t,4),"x":round(cx/wp,5),"y":round(cy/hp,5)}
