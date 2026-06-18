@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="7.0.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="7.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -122,7 +122,7 @@ def detect_reps(frames,min_frames=8):
     return merged
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"7.0.0"}
+def health(): return {"status":"ok","version":"7.1.0"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -168,6 +168,12 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             # Threshold = max absolute floor or 15% of reference, whichever is larger.
             ref_score=plate_bp_score(f0,hist,cx,cy,plate_r)
             min_score=max(12.0,ref_score*0.15)
+            # Gate is only meaningful when the plate has enough visible colour for the
+            # histogram to be discriminative. Fully dark plates (black rubber/plastic
+            # with no coloured hub) produce ref_score near 0 because every pixel is
+            # filtered out by the S>40/V>40 mask. In that case disabling the gate is
+            # correct: it would only produce false rejections of the real plate.
+            gate_enabled=ref_score>=20.0
             del f0,g0
 
             results=[{"t":0.0,"x":round(cx/wp,5),"y":round(cy/hp,5)}]
@@ -195,14 +201,12 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 found=hough_find(gray,int(plate_r*0.75),int(plate_r*1.25),
                                  pred_cx,pred_cy,search_pad)
 
-                # Appearance gate: only applied when Hough's result is suspiciously far
-                # from the predicted position (> 30% of plate radius). Results close to
-                # the prediction are almost certainly the same plate — no check needed.
-                # Results far away may be wrong circles (lifter's body, gym equipment)
-                # grabbed by the large search window, so we verify them against the
-                # reference histogram. Minimum legitimate prediction error in test data:
-                # 52px; minimum wrong-circle prediction error: 132px — safe margin.
-                if found:
+                # Appearance gate: only applied when (a) the plate histogram is
+                # discriminative (gate_enabled) and (b) Hough's result is suspiciously
+                # far from the predicted position (> 30% of plate radius). Close results
+                # are trusted unconditionally; far ones are verified against the plate
+                # histogram to block wrong-circle grabs (lifter's body, equipment).
+                if found and gate_enabled:
                     new_cx,new_cy,_=found
                     dist_from_pred=((new_cx-pred_cx)**2+(new_cy-pred_cy)**2)**0.5
                     if dist_from_pred>plate_r*0.3:

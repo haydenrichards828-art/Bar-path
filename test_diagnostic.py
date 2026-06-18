@@ -64,7 +64,8 @@ if hist_data is None:
 hist,_ = hist_data
 ref_score = plate_bp_score(f0, hist, cx, cy, plate_r)
 min_score = max(12.0, ref_score * 0.15)
-print(f"Appearance ref_score={ref_score:.1f}  min_score={min_score:.1f}")
+gate_enabled = ref_score >= 20.0
+print(f"Appearance ref_score={ref_score:.1f}  min_score={min_score:.1f}  gate_enabled={gate_enabled}")
 save_frame(f0, cx, cy, plate_r, 0, "INIT")
 
 # --- Tracking loop (mirrors main.py v7 exactly) ---
@@ -93,8 +94,9 @@ while True:
     found = hough_find(gray, int(plate_r*0.75), int(plate_r*1.25),
                        pred_cx, pred_cy, search_pad)
 
-    # Appearance gate: only for Hough results far from prediction (> plate_r*0.3)
-    if found:
+    # Appearance gate: only when histogram is discriminative (gate_enabled) and
+    # Hough result is far from prediction
+    if found and gate_enabled:
         fcx, fcy, _ = found
         dist_from_pred = ((fcx-pred_cx)**2+(fcy-pred_cy)**2)**0.5
         if dist_from_pred > plate_r * 0.3:
