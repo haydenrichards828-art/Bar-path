@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="3.0.3")
+app = FastAPI(title="ForceTrack Bar Path API", version="4.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -42,15 +42,12 @@ def rotate_frame(frame, rot):
     if rot==270: return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     return frame
 
-def prep(gray):
-    return cv2.equalizeHist(gray)
-
 def hough_find(gray, min_r, max_r, cx_hint, cy_hint, pad):
     h,w=gray.shape
     sx=max(0,int(cx_hint-pad)); sy=max(0,int(cy_hint-pad))
     ex=min(w,int(cx_hint+pad)); ey=min(h,int(cy_hint+pad))
     if ex-sx<10 or ey-sy<10: return None
-    roi=gray[sy:ey,sx:ex]; b=cv2.GaussianBlur(roi,(9,9),2)
+    eq=cv2.equalizeHist(gray[sy:ey,sx:ex]); b=cv2.GaussianBlur(eq,(9,9),2)
     for p2 in [30,24,18,12,8,5]:
         c=cv2.HoughCircles(b,cv2.HOUGH_GRADIENT,1.2,(ey-sy)//2,param1=80,param2=p2,minRadius=min_r,maxRadius=max_r)
         if c is not None:
@@ -58,40 +55,32 @@ def hough_find(gray, min_r, max_r, cx_hint, cy_hint, pad):
             return float(best[0]+sx),float(best[1]+sy),float(best[2])
     return None
 
-def make_template(proc_gray, cx, cy, tpad):
-    h,w=proc_gray.shape
-    x0=max(0,int(cx)-tpad); y0=max(0,int(cy)-tpad)
-    x1=min(w,int(cx)+tpad); y1=min(h,int(cy)+tpad)
-    if x1-x0<10 or y1-y0<10: return None,None,tpad
-    patch=proc_gray[y0:y1,x0:x1].copy()
-    actual_hx=int(cx)-x0; actual_hy=int(cy)-y0
-    mask=np.zeros(patch.shape,dtype=np.uint8)
-    r=int(min(actual_hx,actual_hy)*0.90)
-    cv2.circle(mask,(actual_hx,actual_hy),max(4,r),255,-1)
-    return patch,mask,(actual_hx,actual_hy)
+def build_hist(bgr_frame, cx, cy, r):
+    """Build HSV colour histogram from the plate region — exact approach used by
+    working open-source barbell trackers (mean-shift / CamShift tracking)."""
+    h,w=bgr_frame.shape[:2]
+    x0=max(0,int(cx-r)); y0=max(0,int(cy-r))
+    x1=min(w,int(cx+r)); y1=min(h,int(cy+r))
+    roi=bgr_frame[y0:y1,x0:x1]
+    if roi.size==0: return None
+    hsv_roi=cv2.cvtColor(roi,cv2.COLOR_BGR2HSV)
+    # Loose mask: excludes only near-zero saturation/value noise, keeps dark plates
+    mask=cv2.inRange(hsv_roi, np.array((0.,15.,15.)), np.array((180.,255.,255.)))
+    # 2D Hue-Saturation histogram — more discriminative than hue alone
+    hist=cv2.calcHist([hsv_roi],[0,1],mask,[30,32],[0,180,0,256])
+    cv2.normalize(hist,hist,0,255,cv2.NORM_MINMAX)
+    return hist,(x0,y0,x1-x0,y1-y0)
 
-def template_match(proc_gray, tmpl, tmpl_mask, half_wh, cx, cy, search_r):
-    """SQDIFF_NORMED with mask — the reliable, well-supported masked-matching
-    combo in OpenCV. Lower score = better match (0 = perfect). Unlike CCORR_NORMED,
-    SQDIFF is shape/texture-sensitive and won't be fooled by flat dark regions
-    (floor, shadows, rack uprights) that happen to be similar average brightness."""
-    if tmpl is None: return None
-    th,tw=tmpl.shape; h,w=proc_gray.shape
-    hx,hy=half_wh
-    sx=max(0,int(cx)-int(search_r)-hx)
-    sy=max(0,int(cy)-int(search_r)-hy)
-    ex=min(w-tw,int(cx)+int(search_r)-hx+1)
-    ey=min(h-th,int(cy)+int(search_r)-hy+1)
-    if ex<=sx or ey<=sy: return None
-    region=proc_gray[sy:ey+th, sx:ex+tw]
-    if region.shape[0]<th or region.shape[1]<tw: return None
-    result=cv2.matchTemplate(region,tmpl,cv2.TM_SQDIFF_NORMED,mask=tmpl_mask)
-    min_val,_,min_loc,_=cv2.minMaxLoc(result)
-    if min_val>0.35: return None  # lower=better; reject poor matches
-    ncx=float(sx+min_loc[0]+hx)
-    ncy=float(sy+min_loc[1]+hy)
-    confidence=1.0-min_val
-    return ncx,ncy,confidence
+TERM_CRIT=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT,15,1)
+
+def camshift_step(bgr_frame, hist, track_window):
+    hsv=cv2.cvtColor(bgr_frame,cv2.COLOR_BGR2HSV)
+    dst=cv2.calcBackProject([hsv],[0,1],hist,[0,180,0,256],1)
+    ret,new_window=cv2.CamShift(dst,track_window,TERM_CRIT)
+    x,y,w,h=new_window
+    if w<4 or h<4: return None,track_window
+    cx=x+w/2.0; cy=y+h/2.0
+    return (cx,cy),new_window
 
 def smooth_coords(xs,ys,window=5):
     if len(xs)<window: return xs,ys
@@ -121,7 +110,7 @@ def detect_reps(frames,min_frames=8):
     return merged
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"3.0.3"}
+def health(): return {"status":"ok","version":"4.0.0"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -147,49 +136,59 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             ret,f0=cap.read()
             if not ret: yield json.dumps({"error":"Cannot read first frame"})+"\n"; return
             f0=rotate_frame(f0,rot); raw_h,raw_w=f0.shape[:2]; wp,hp=raw_w,raw_h
-            g0=cv2.cvtColor(f0,cv2.COLOR_BGR2GRAY); p0=prep(g0); del f0
+            g0=cv2.cvtColor(f0,cv2.COLOR_BGR2GRAY)
             try: p=json.loads(params)
             except: p={}
             tx=float(p.get("start_x",0.5))*wp; ty=float(p.get("start_y",0.5))*hp
             min_r=max(10,int(hp*0.05)); max_r=min(wp//2,int(hp*0.47))
-            det=hough_find(p0,min_r,max_r,tx,ty,int(min(wp,hp)*0.35))
-            if det is None: det=hough_find(p0,min_r,max_r,wp//2,hp//2,min(wp,hp)//2)
+            det=hough_find(g0,min_r,max_r,tx,ty,int(min(wp,hp)*0.35))
+            if det is None: det=hough_find(g0,min_r,max_r,wp//2,hp//2,min(wp,hp)//2)
             if det is None: det=(tx,ty,max(min_r*2,int(hp*0.09)))
             cx,cy,plate_r=det; plate_r=max(min_r,plate_r)
             px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
-            tpad=int(plate_r*0.9)
-            tmpl,tmpl_mask,half_wh=make_template(p0,cx,cy,tpad)
-            if tmpl is None: yield json.dumps({"error":"Could not build template"})+"\n"; return
-            del g0
+
+            hist_data=build_hist(f0,cx,cy,plate_r)
+            if hist_data is None: yield json.dumps({"error":"Could not build colour histogram"})+"\n"; return
+            hist,track_window=hist_data
+            del f0,g0
+
             results=[{"t":0.0,"x":round(cx/wp,5),"y":round(cy/hp,5)}]
             yield json.dumps({"frame":results[0]})+"\n"
             cap.set(cv2.CAP_PROP_POS_FRAMES,0); fn=0; last_t=0.0
-            frames_since_update=0; UPDATE_EVERY=8
+            frames_since_hough=0; HOUGH_EVERY=6; bad_streak=0
 
             while True:
                 ret,frame=cap.read()
                 if not ret: break
                 frame=rotate_frame(frame,rot)
-                gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY); del frame
-                pg=prep(gray)
                 msec_t=cap.get(cv2.CAP_PROP_POS_MSEC)/1000.0
                 t=msec_t if msec_t>last_t else fn/fps
 
-                match=template_match(pg,tmpl,tmpl_mask,half_wh,cx,cy,plate_r*3.0)
-                if match is None:
-                    match=template_match(pg,tmpl,tmpl_mask,half_wh,cx,cy,plate_r*6.0)
+                pos,track_window=camshift_step(frame,hist,track_window)
+                if pos is not None:
+                    cx,cy=pos; bad_streak=0
+                else:
+                    bad_streak+=1
 
-                if match is not None:
-                    ncx,ncy,conf=match
-                    cx,cy=ncx,ncy
-                    frames_since_update+=1
-                    if frames_since_update>=UPDATE_EVERY and conf>0.70:
-                        frames_since_update=0
-                        new_tmpl,new_mask,_=make_template(pg,cx,cy,tpad)
-                        if new_tmpl is not None and new_tmpl.shape==tmpl.shape:
-                            tmpl=cv2.addWeighted(tmpl,0.4,new_tmpl,0.6,0)
+                # Periodic Hough validation — confirms a real circle exists near
+                # the tracked point. If not (tracker drifted onto a static
+                # non-circular object), relocate via wide Hough search.
+                frames_since_hough+=1
+                if frames_since_hough>=HOUGH_EVERY or bad_streak>=2:
+                    frames_since_hough=0
+                    gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
+                    pad=plate_r*(1.8 if bad_streak<2 else 5.0)
+                    rd=hough_find(gray,int(plate_r*0.6),int(plate_r*1.5),cx,cy,pad)
+                    if rd:
+                        ncx,ncy,rr=rd
+                        if 0.5*plate_r<rr<1.8*plate_r:
+                            cx,cy=ncx,ncy; bad_streak=0
+                            x0=max(0,int(cx-plate_r)); y0=max(0,int(cy-plate_r))
+                            track_window=(x0,y0,int(plate_r*2),int(plate_r*2))
+                            # Refresh histogram with current appearance
+                            new_hist_data=build_hist(frame,cx,cy,plate_r)
+                            if new_hist_data: hist,_=new_hist_data
 
-                del pg,gray
                 frame_data={"t":round(t,4),"x":round(cx/wp,5),"y":round(cy/hp,5)}
                 results.append(frame_data); yield json.dumps({"frame":frame_data})+"\n"
                 fn+=1; last_t=t
