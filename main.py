@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="7.1.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="7.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -122,7 +122,7 @@ def detect_reps(frames,min_frames=8):
     return merged
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"7.1.0"}
+def health(): return {"status":"ok","version":"7.2.0"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -245,9 +245,10 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
 
             cap.release()
             if results:
-                xs=np.array([f['x'] for f in results]); ys=np.array([f['y'] for f in results])
-                xs_s,ys_s=smooth_coords(xs.tolist(),ys.tolist(),window=5)
-                for i,f in enumerate(results): f['x']=round(xs_s[i],5); f['y']=round(ys_s[i],5)
+                pass  # smooth_coords removed: caused 12-17px amplitude compression and
+                      # 1-2 frame temporal displacement at turnarounds, making the dot
+                      # appear to reverse before the bar does. Hough jitter at rest is
+                      # only ~7px (imperceptible), so smoothing is net harmful.
             reps=detect_reps(results); rep_metrics=[]
             for rep in reps:
                 seg=results[rep['start']:rep['end']+1]
