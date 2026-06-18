@@ -166,7 +166,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             hist,_=hist_data
             # Appearance reference: plate score at frame 0 to gate Hough candidates.
             # Threshold = max absolute floor or 15% of reference, whichever is larger.
-            ref_score=plate_bp_score(f0,cx,cy,plate_r)
+            ref_score=plate_bp_score(f0,hist,cx,cy,plate_r)
             min_score=max(12.0,ref_score*0.15)
             del f0,g0
 
