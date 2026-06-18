@@ -3,12 +3,15 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="1.4.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="1.5.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-PLATE_DIAMETER_M = 0.450  # Standard Olympic plate — 10kg+ all 450mm
-SCALE            = 1.0    # Full resolution — maximises Hough + LK accuracy
+PLATE_DIAMETER_M = 0.450
+SCALE            = 1.0
 CLAHE            = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+FB_THRESHOLD     = 2.0   # Raised from 1.5 — full-res 1080p naturally has higher FB error
+MIN_FEATURES     = 30    # Replenish before we get low, not after we're already struggling
+HOUGH_EVERY      = 10
 
 def get_rotation(path):
     try:
@@ -42,11 +45,20 @@ def hough_detect(gray, min_r, max_r, cx_hint, cy_hint, search_pad):
             return float(best[0]+sx), float(best[1]+sy), float(best[2])
     return None
 
+def hough_recover(gray, cx, cy, plate_r, wp, hp):
+    """Progressive Hough search — widens radius until plate found or gives up."""
+    min_r = int(plate_r*0.5); max_r = int(plate_r*1.5)
+    for scale in [2.2, 3.5, 5.0, 7.0]:
+        result = hough_detect(gray, min_r, max_r, cx, cy, plate_r*scale)
+        if result:
+            return result
+    return None
+
 def seed_pts(gray, cx, cy, r):
     eg = enhance(gray)
     mask = np.zeros(gray.shape, np.uint8)
     cv2.circle(mask, (int(cx), int(cy)), int(max(4, r*0.88)), 255, -1)
-    pts = cv2.goodFeaturesToTrack(eg, 150, 0.006, 3, mask=mask, blockSize=7)
+    pts = cv2.goodFeaturesToTrack(eg, 150, 0.005, 3, mask=mask, blockSize=7)
     if pts is not None and len(pts) >= 6: return pts
     grid = []; step = max(2.0, r*0.22); dy = -r*0.75
     while dy <= r*0.75:
@@ -58,32 +70,27 @@ def seed_pts(gray, cx, cy, r):
     return np.array(grid, dtype=np.float32) if grid else np.array([[[cx,cy]]], dtype=np.float32)
 
 class Kalman2D:
-    """Position + velocity Kalman filter — smooths LK noise, rejects outlier frames."""
+    """Position + velocity Kalman — smooths LK noise on good frames only."""
     def __init__(self, x0, y0):
         self.kf = cv2.KalmanFilter(4, 2)
-        self.kf.measurementMatrix  = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
-        self.kf.transitionMatrix   = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], np.float32)
-        self.kf.processNoiseCov    = np.eye(4, dtype=np.float32) * 0.05
-        self.kf.measurementNoiseCov= np.eye(2, dtype=np.float32) * 2.0
-        self.kf.statePre = np.array([[x0],[y0],[0.0],[0.0]], np.float32)
-        self.kf.statePost= np.array([[x0],[y0],[0.0],[0.0]], np.float32)
+        self.kf.measurementMatrix   = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
+        self.kf.transitionMatrix    = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], np.float32)
+        self.kf.processNoiseCov     = np.eye(4, dtype=np.float32) * 0.05
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 2.0
+        self.kf.statePre  = np.array([[x0],[y0],[0.0],[0.0]], np.float32)
+        self.kf.statePost = np.array([[x0],[y0],[0.0],[0.0]], np.float32)
     def update(self, x, y):
-        pred = self.kf.predict()
-        m = np.array([[x],[y]], np.float32)
-        corr = self.kf.correct(m)
+        self.kf.predict()
+        corr = self.kf.correct(np.array([[x],[y]], np.float32))
         return float(corr[0]), float(corr[1])
-    def predict_only(self):
-        pred = self.kf.predict()
-        return float(pred[0]), float(pred[1])
+    # No predict_only — we never invent a position we don't have evidence for
 
 def smooth_coords(xs, ys, window=7):
     if len(xs) < window: return xs, ys
     w = window if window % 2 == 1 else window+1
     k = np.ones(w)/w
-    xs_s = np.convolve(xs, k, mode='same'); ys_s = np.convolve(ys, k, mode='same')
-    h = w//2
-    xs_s[:h]=xs[:h]; xs_s[-h:]=xs[-h:]
-    ys_s[:h]=ys[:h]; ys_s[-h:]=ys[-h:]
+    xs_s=np.convolve(xs,k,mode='same'); ys_s=np.convolve(ys,k,mode='same')
+    h=w//2; xs_s[:h]=xs[:h]; xs_s[-h:]=xs[-h:]; ys_s[:h]=ys[:h]; ys_s[-h:]=ys[-h:]
     return xs_s.tolist(), ys_s.tolist()
 
 def detect_reps(frames, min_frames=8):
@@ -111,7 +118,7 @@ LK = dict(winSize=(31,31), maxLevel=4,
     criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT, 30, 0.01))
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"1.4.0"}
+def health(): return {"status":"ok","version":"1.5.0"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -135,84 +142,86 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             if not ret: yield json.dumps({"error":"Cannot read first frame"})+"\n"; return
             f0 = rotate_frame(f0, rot)
             raw_h, raw_w = f0.shape[:2]
-            wp = int(raw_w * SCALE); hp = int(raw_h * SCALE)
-            f0s = cv2.resize(f0, (wp, hp)) if SCALE != 1.0 else f0
+            wp = int(raw_w*SCALE); hp = int(raw_h*SCALE)
+            f0s = f0 if SCALE==1.0 else cv2.resize(f0,(wp,hp))
             g0  = cv2.cvtColor(f0s, cv2.COLOR_BGR2GRAY)
             del f0, f0s
             try: p = json.loads(params)
             except: p = {}
-            tx = float(p.get("start_x", 0.5)) * wp
-            ty = float(p.get("start_y", 0.5)) * hp
-            min_r = max(10, int(hp*0.05)); max_r = min(wp//2, int(hp*0.47))
-            pad   = int(min(wp,hp)*0.35)
-            det = hough_detect(g0, min_r, max_r, tx, ty, pad)
-            if det is None: det = hough_detect(g0, min_r, max_r, wp//2, hp//2, min(wp,hp)//2)
-            if det is None: det = (tx, ty, max(min_r*2, int(hp*0.09)))
-            cx, cy, plate_r = det; plate_r = max(min_r, plate_r)
-            px_per_m = plate_r / (PLATE_DIAMETER_M / 2.0)
-            prev_gray = enhance(g0.copy())
-            p0 = seed_pts(g0, cx, cy, plate_r); del g0
-            kal = Kalman2D(cx, cy)  # Kalman filter initialised at detected plate center
-            results = [{"t":0.0,"x":round(cx/wp,5),"y":round(cy/hp,5)}]
+            tx = float(p.get("start_x",0.5))*wp; ty = float(p.get("start_y",0.5))*hp
+            min_r=max(10,int(hp*0.05)); max_r=min(wp//2,int(hp*0.47))
+            pad=int(min(wp,hp)*0.35)
+            det = hough_detect(g0,min_r,max_r,tx,ty,pad)
+            if det is None: det = hough_detect(g0,min_r,max_r,wp//2,hp//2,min(wp,hp)//2)
+            if det is None: det = (tx,ty,max(min_r*2,int(hp*0.09)))
+            cx,cy,plate_r=det; plate_r=max(min_r,plate_r)
+            px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
+            prev_gray=enhance(g0.copy()); p0=seed_pts(g0,cx,cy,plate_r); del g0
+            kal=Kalman2D(cx,cy)
+            results=[{"t":0.0,"x":round(cx/wp,5),"y":round(cy/hp,5)}]
             yield json.dumps({"frame":results[0]})+"\n"
-            frames_since_hough = 0; HOUGH_EVERY = 10
-            # 60fps support: budget by time not frame count
-            # Process up to 900 "logical" frames — at 60fps skip every 2nd frame
-            # at 30fps process every frame, at 120fps skip every 4th
-            target_fps   = 30.0
-            proc_every   = max(1, round(fps / target_fps))
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0); fn=0; proc=0
+            frames_since_hough=0
+            proc_every=max(1,round(fps/30.0))  # 60fps→every 2nd, 30fps→every frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES,0); fn=0; proc=0
+
             while True:
-                ret, frame = cap.read()
+                ret,frame=cap.read()
                 if not ret: break
-                frame = rotate_frame(frame, rot)
-                small = cv2.resize(frame, (wp, hp)) if SCALE != 1.0 else frame
-                t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0; del frame
-                curr_raw  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY); del small
-                curr_gray = enhance(curr_raw)
-                if fn % proc_every == 0:
-                    # Bidirectional LK
-                    p1, sf, _  = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, p0, None, **LK)
-                    p0r, sb, _ = cv2.calcOpticalFlowPyrLK(curr_gray, prev_gray, p1, None, **LK)
-                    fb = np.abs(p0-p0r).reshape(-1,2).max(axis=1)
-                    good = (sf.ravel()==1)&(sb.ravel()==1)&(fb<1.5)
-                    if good.sum() >= 4:
+                frame=rotate_frame(frame,rot)
+                small=frame if SCALE==1.0 else cv2.resize(frame,(wp,hp))
+                t=cap.get(cv2.CAP_PROP_POS_MSEC)/1000.0; del frame
+                curr_raw=cv2.cvtColor(small,cv2.COLOR_BGR2GRAY); del small
+                curr_gray=enhance(curr_raw)
+
+                if fn%proc_every==0:
+                    # ── Bidirectional LK ──────────────────────────────────
+                    p1,sf,_=cv2.calcOpticalFlowPyrLK(prev_gray,curr_gray,p0,None,**LK)
+                    p0r,sb,_=cv2.calcOpticalFlowPyrLK(curr_gray,prev_gray,p1,None,**LK)
+                    fb=np.abs(p0-p0r).reshape(-1,2).max(axis=1)
+                    good=(sf.ravel()==1)&(sb.ravel()==1)&(fb<FB_THRESHOLD)
+
+                    if good.sum()>=4:
                         gn=p1[good]; go=p0[good]
-                        raw_cx = cx + float(np.median(gn[:,0,0]-go[:,0,0]))
-                        raw_cy = cy + float(np.median(gn[:,0,1]-go[:,0,1]))
-                        raw_cx = float(np.clip(raw_cx, plate_r, wp-plate_r))
-                        raw_cy = float(np.clip(raw_cy, plate_r, hp-plate_r))
-                        # Kalman: blend LK measurement with physical prediction
-                        cx, cy = kal.update(raw_cx, raw_cy)
-                        p0 = gn.reshape(-1,1,2)
+                        raw_cx=float(np.clip(cx+float(np.median(gn[:,0,0]-go[:,0,0])),plate_r,wp-plate_r))
+                        raw_cy=float(np.clip(cy+float(np.median(gn[:,0,1]-go[:,0,1])),plate_r,hp-plate_r))
+                        cx,cy=kal.update(raw_cx,raw_cy)
+                        p0=gn.reshape(-1,1,2)
                     else:
-                        # No good points — use Kalman prediction
-                        cx, cy = kal.predict_only()
-                    # Early re-anchor when tracking is weak
-                    if good.sum() < 8:
-                        rd = hough_detect(curr_raw, int(plate_r*0.65), int(plate_r*1.35), cx, cy, plate_r*2.2)
-                        if rd:
-                            ncx, ncy, _ = rd
-                            if (ncx-cx)**2+(ncy-cy)**2 < (plate_r*1.6)**2:
-                                cx, cy = kal.update(ncx, ncy)
-                                np_=seed_pts(curr_raw, cx, cy, plate_r)
-                                if len(np_)>=4: p0=np_; frames_since_hough=0
-                    frames_since_hough+=1
-                    if frames_since_hough >= HOUGH_EVERY:
-                        frames_since_hough=0
-                        rd = hough_detect(curr_raw, int(plate_r*0.65), int(plate_r*1.35), cx, cy, plate_r*2.8)
+                        # LK failed — progressive Hough recovery, no prediction
+                        rd=hough_recover(curr_raw,cx,cy,plate_r,wp,hp)
                         if rd:
                             ncx,ncy,_=rd
-                            if (ncx-cx)**2+(ncy-cy)**2 < (plate_r*2.0)**2:
+                            cx,cy=kal.update(ncx,ncy)
+                            p0=seed_pts(curr_raw,cx,cy,plate_r)
+                            frames_since_hough=0
+                        # else: hold cx,cy — no fake movement
+
+                    # ── Proactive feature replenishment ───────────────────
+                    # Refill BEFORE features get critically low
+                    if len(p0)<MIN_FEATURES:
+                        new_pts=seed_pts(curr_raw,cx,cy,plate_r)
+                        if len(new_pts)>len(p0): p0=new_pts
+
+                    # ── Scheduled Hough re-anchor ─────────────────────────
+                    frames_since_hough+=1
+                    if frames_since_hough>=HOUGH_EVERY:
+                        frames_since_hough=0
+                        rd=hough_detect(curr_raw,int(plate_r*0.65),int(plate_r*1.35),cx,cy,plate_r*2.8)
+                        if rd:
+                            ncx,ncy,_=rd
+                            if (ncx-cx)**2+(ncy-cy)**2<(plate_r*2.0)**2:
                                 cx,cy=kal.update(ncx,ncy)
-                                np_=seed_pts(curr_raw,cx,cy,plate_r)
-                                if len(np_)>=4: p0=np_
+                                new_pts=seed_pts(curr_raw,cx,cy,plate_r)
+                                if len(new_pts)>=4: p0=new_pts
+
                     frame_data={"t":round(t,4),"x":round(cx/wp,5),"y":round(cy/hp,5)}
                     results.append(frame_data)
                     yield json.dumps({"frame":frame_data})+"\n"
                     proc+=1
                     if proc%30==0: await asyncio.sleep(0)
+
                 prev_gray=curr_gray; fn+=1
+
             cap.release()
             if results:
                 xs=np.array([f['x'] for f in results]); ys=np.array([f['y'] for f in results])
