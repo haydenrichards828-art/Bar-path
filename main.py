@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="3.0.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="3.0.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -42,6 +42,10 @@ def rotate_frame(frame, rot):
     if rot==270: return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     return frame
 
+def prep(gray):
+    """Consistent preprocessing for both template building and search frames."""
+    return cv2.equalizeHist(gray)
+
 def hough_find(gray, min_r, max_r, cx_hint, cy_hint, pad):
     h,w=gray.shape
     sx=max(0,int(cx_hint-pad)); sy=max(0,int(cy_hint-pad))
@@ -55,23 +59,37 @@ def hough_find(gray, min_r, max_r, cx_hint, cy_hint, pad):
             return float(best[0]+sx),float(best[1]+sy),float(best[2])
     return None
 
-def template_match(gray, tmpl, cx, cy, search_r):
-    """Find template in gray frame within search_r pixels of (cx,cy).
+def make_template(proc_gray, cx, cy, tpad):
+    """Extract template patch from preprocessed frame.
+    Uses same preprocessing as search — consistent for TM_CCOEFF_NORMED."""
+    h,w=proc_gray.shape
+    x0=max(0,int(cx)-tpad); y0=max(0,int(cy)-tpad)
+    x1=min(w,int(cx)+tpad); y1=min(h,int(cy)+tpad)
+    if x1-x0<10 or y1-y0<10: return None,tpad
+    patch=proc_gray[y0:y1,x0:x1].copy()
+    # Record actual half-sizes in case we clipped at frame edge
+    actual_hx=int(cx)-x0; actual_hy=int(cy)-y0
+    return patch,(actual_hx,actual_hy)
+
+def template_match(proc_gray, tmpl, half_wh, cx, cy, search_r):
+    """Match template in preprocessed frame.
     Returns (new_cx, new_cy, confidence) or None."""
-    th,tw=tmpl.shape; h,w=gray.shape
-    half_tw=tw//2; half_th=th//2
-    sx=max(0,int(cx-search_r-half_tw))
-    sy=max(0,int(cy-search_r-half_th))
-    ex=min(w-tw,int(cx+search_r-half_tw)+1)
-    ey=min(h-th,int(cy+search_r-half_th)+1)
+    if tmpl is None: return None
+    th,tw=tmpl.shape; h,w=proc_gray.shape
+    hx,hy=half_wh
+    # Search window: ensure template fits inside
+    sx=max(0,int(cx)-int(search_r)-hx)
+    sy=max(0,int(cy)-int(search_r)-hy)
+    ex=min(w-tw,int(cx)+int(search_r)-hx+1)
+    ey=min(h-th,int(cy)+int(search_r)-hy+1)
     if ex<=sx or ey<=sy: return None
-    region=gray[sy:ey+th, sx:ex+tw]
+    region=proc_gray[sy:ey+th, sx:ex+tw]
     if region.shape[0]<th or region.shape[1]<tw: return None
     result=cv2.matchTemplate(region,tmpl,cv2.TM_CCOEFF_NORMED)
     _,max_val,_,max_loc=cv2.minMaxLoc(result)
-    if max_val<0.25: return None
-    ncx=float(sx+max_loc[0]+half_tw)
-    ncy=float(sy+max_loc[1]+half_th)
+    if max_val<0.30: return None
+    ncx=float(sx+max_loc[0]+hx)
+    ncy=float(sy+max_loc[1]+hy)
     return ncx,ncy,max_val
 
 def smooth_coords(xs,ys,window=5):
@@ -102,7 +120,7 @@ def detect_reps(frames,min_frames=8):
     return merged
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"3.0.0"}
+def health(): return {"status":"ok","version":"3.0.1"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -128,30 +146,25 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             ret,f0=cap.read()
             if not ret: yield json.dumps({"error":"Cannot read first frame"})+"\n"; return
             f0=rotate_frame(f0,rot); raw_h,raw_w=f0.shape[:2]; wp,hp=raw_w,raw_h
-            g0=cv2.cvtColor(f0,cv2.COLOR_BGR2GRAY); del f0
+            g0=cv2.cvtColor(f0,cv2.COLOR_BGR2GRAY)
+            p0=prep(g0); del f0  # preprocessed frame 0
             try: p=json.loads(params)
             except: p={}
             tx=float(p.get("start_x",0.5))*wp; ty=float(p.get("start_y",0.5))*hp
             min_r=max(10,int(hp*0.05)); max_r=min(wp//2,int(hp*0.47))
 
-            # Find plate circle from frame 0
-            eq0=cv2.equalizeHist(g0)
-            det=hough_find(eq0,min_r,max_r,tx,ty,int(min(wp,hp)*0.35))
-            if det is None: det=hough_find(eq0,min_r,max_r,wp//2,hp//2,min(wp,hp)//2)
+            # Detect plate on preprocessed frame
+            det=hough_find(p0,min_r,max_r,tx,ty,int(min(wp,hp)*0.35))
+            if det is None: det=hough_find(p0,min_r,max_r,wp//2,hp//2,min(wp,hp)//2)
             if det is None: det=(tx,ty,max(min_r*2,int(hp*0.09)))
             cx,cy,plate_r=det; plate_r=max(min_r,plate_r)
             px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
 
-            # Build initial template — padded square around plate
-            tpad=int(plate_r*1.3)
-            def make_template(gray, ecx, ecy, tpad):
-                x0=max(0,int(ecx)-tpad); y0=max(0,int(ecy)-tpad)
-                x1=min(gray.shape[1],int(ecx)+tpad); y1=min(gray.shape[0],int(ecy)+tpad)
-                if x1-x0<10 or y1-y0<10: return None
-                return gray[y0:y1,x0:x1].copy()
-
-            template=make_template(g0,cx,cy,tpad); del g0
-            if template is None: yield json.dumps({"error":"Could not build template"})+"\n"; return
+            # Template from preprocessed frame — smaller pad so plate is findable near edges
+            tpad=int(plate_r*0.9)
+            tmpl,half_wh=make_template(p0,cx,cy,tpad)
+            if tmpl is None: yield json.dumps({"error":"Could not build template"})+"\n"; return
+            del g0
 
             results=[{"t":0.0,"x":round(cx/wp,5),"y":round(cy/hp,5)}]
             yield json.dumps({"frame":results[0]})+"\n"
@@ -163,34 +176,30 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 if not ret: break
                 frame=rotate_frame(frame,rot)
                 gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY); del frame
-                eqg=cv2.equalizeHist(gray)
+                pg=prep(gray)  # same preprocessing as template
                 msec_t=cap.get(cv2.CAP_PROP_POS_MSEC)/1000.0
                 t=msec_t if msec_t>last_t else fn/fps
 
-                # Primary: template match with normal search radius
-                match=template_match(eqg,template,cx,cy,plate_r*3.0)
-
+                # Normal search radius first
+                match=template_match(pg,tmpl,half_wh,cx,cy,plate_r*3.0)
                 if match is None:
-                    # Wider search for fast/large movements
-                    match=template_match(eqg,template,cx,cy,plate_r*6.0)
+                    # Wider — handles fast movement
+                    match=template_match(pg,tmpl,half_wh,cx,cy,plate_r*6.0)
 
                 if match is not None:
                     ncx,ncy,conf=match
                     cx,cy=ncx,ncy
-                    # Periodically update template with fresh appearance
                     frames_since_update+=1
                     if frames_since_update>=UPDATE_EVERY and conf>0.45:
                         frames_since_update=0
-                        new_tmpl=make_template(gray,cx,cy,tpad)
-                        if new_tmpl is not None and new_tmpl.shape==template.shape:
-                            # Blend old and new to stay robust
-                            template=cv2.addWeighted(template,0.4,new_tmpl,0.6,0)
-                # else: hold last known position
+                        new_tmpl,_=make_template(pg,cx,cy,tpad)
+                        if new_tmpl is not None and new_tmpl.shape==tmpl.shape:
+                            tmpl=cv2.addWeighted(tmpl,0.4,new_tmpl,0.6,0)
 
-                del eqg
+                del pg,gray
                 frame_data={"t":round(t,4),"x":round(cx/wp,5),"y":round(cy/hp,5)}
                 results.append(frame_data); yield json.dumps({"frame":frame_data})+"\n"
-                del gray; fn+=1; last_t=t
+                fn+=1; last_t=t
                 if fn%30==0: await asyncio.sleep(0)
 
             cap.release()
