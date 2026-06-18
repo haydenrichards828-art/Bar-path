@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="4.0.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="5.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -56,17 +56,19 @@ def hough_find(gray, min_r, max_r, cx_hint, cy_hint, pad):
     return None
 
 def build_hist(bgr_frame, cx, cy, r):
-    """Build HSV colour histogram from the plate region — exact approach used by
-    working open-source barbell trackers (mean-shift / CamShift tracking)."""
     h,w=bgr_frame.shape[:2]
     x0=max(0,int(cx-r)); y0=max(0,int(cy-r))
     x1=min(w,int(cx+r)); y1=min(h,int(cy+r))
     roi=bgr_frame[y0:y1,x0:x1]
     if roi.size==0: return None
+    roi_h,roi_w=roi.shape[:2]
+    # Circular mask — only sample pixels inside the plate disc, not square ROI corners
+    Ygrid,Xgrid=np.ogrid[:roi_h,:roi_w]
+    circ_mask=((Xgrid-(cx-x0))**2+(Ygrid-(cy-y0))**2<=r**2).astype(np.uint8)*255
     hsv_roi=cv2.cvtColor(roi,cv2.COLOR_BGR2HSV)
-    # Loose mask: excludes only near-zero saturation/value noise, keeps dark plates
-    mask=cv2.inRange(hsv_roi, np.array((0.,15.,15.)), np.array((180.,255.,255.)))
-    # 2D Hue-Saturation histogram — more discriminative than hue alone
+    # S>40, V>40 excludes background grays/whites and deep shadow; keeps plate rubber+hub
+    hsv_mask=cv2.inRange(hsv_roi,np.array((0.,40.,40.)),np.array((180.,255.,255.)))
+    mask=cv2.bitwise_and(circ_mask,hsv_mask)
     hist=cv2.calcHist([hsv_roi],[0,1],mask,[30,32],[0,180,0,256])
     cv2.normalize(hist,hist,0,255,cv2.NORM_MINMAX)
     return hist,(x0,y0,x1-x0,y1-y0)
@@ -110,7 +112,7 @@ def detect_reps(frames,min_frames=8):
     return merged
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"4.0.0"}
+def health(): return {"status":"ok","version":"5.0.0"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -140,8 +142,10 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             try: p=json.loads(params)
             except: p={}
             tx=float(p.get("start_x",0.5))*wp; ty=float(p.get("start_y",0.5))*hp
-            min_r=max(10,int(hp*0.05)); max_r=min(wp//2,int(hp*0.47))
-            det=hough_find(g0,min_r,max_r,tx,ty,int(min(wp,hp)*0.35))
+            # Radius range tuned to a single bumper plate: 5–30% of the shorter frame side
+            short_side=min(wp,hp)
+            min_r=max(10,int(short_side*0.05)); max_r=int(short_side*0.30)
+            det=hough_find(g0,min_r,max_r,tx,ty,int(short_side*0.35))
             if det is None: det=hough_find(g0,min_r,max_r,wp//2,hp//2,min(wp,hp)//2)
             if det is None: det=(tx,ty,max(min_r*2,int(hp*0.09)))
             cx,cy,plate_r=det; plate_r=max(min_r,plate_r)
@@ -170,24 +174,18 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 else:
                     bad_streak+=1
 
-                # Periodic Hough validation — confirms a real circle exists near
-                # the tracked point. If not (tracker drifted onto a static
-                # non-circular object), relocate via wide Hough search.
                 frames_since_hough+=1
                 if frames_since_hough>=HOUGH_EVERY or bad_streak>=2:
                     frames_since_hough=0
                     gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
-                    pad=plate_r*(1.8 if bad_streak<2 else 5.0)
-                    rd=hough_find(gray,int(plate_r*0.6),int(plate_r*1.5),cx,cy,pad)
+                    pad=plate_r*(2.0 if bad_streak<2 else 5.0)
+                    rd=hough_find(gray,int(plate_r*0.75),int(plate_r*1.25),cx,cy,pad)
                     if rd:
                         ncx,ncy,rr=rd
-                        if 0.5*plate_r<rr<1.8*plate_r:
+                        if 0.75*plate_r<rr<1.25*plate_r:
                             cx,cy=ncx,ncy; bad_streak=0
                             x0=max(0,int(cx-plate_r)); y0=max(0,int(cy-plate_r))
                             track_window=(x0,y0,int(plate_r*2),int(plate_r*2))
-                            # Refresh histogram with current appearance
-                            new_hist_data=build_hist(frame,cx,cy,plate_r)
-                            if new_hist_data: hist,_=new_hist_data
 
                 frame_data={"t":round(t,4),"x":round(cx/wp,5),"y":round(cy/hp,5)}
                 results.append(frame_data); yield json.dumps({"frame":frame_data})+"\n"
