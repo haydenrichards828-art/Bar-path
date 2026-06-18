@@ -3,14 +3,14 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="2.0.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="2.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
-CLAHE            = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-FB_THRESHOLD     = 2.0
-MIN_FEATURES     = 60
-TARGET_RES       = 1920
+# Lighter CLAHE — aggressive enhancement creates false features in background
+CLAHE       = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+FB_THRESHOLD = 2.0
+TARGET_RES   = 1920
 
 def get_rotation(path):
     try:
@@ -64,20 +64,16 @@ def hough_detect(gray, min_r, max_r, cx_hint, cy_hint, search_pad):
     return None
 
 def hough_recover(gray, cx, cy, plate_r):
-    """Progressive search — NO distance validation. If we find a plate-sized circle
-    anywhere nearby, trust it. The radius check alone prevents false positives."""
     min_r=int(plate_r*0.5); max_r=int(plate_r*1.6)
-    for scale in [2.5, 4.0, 6.0, 9.0]:
-        result = hough_detect(gray, min_r, max_r, cx, cy, plate_r*scale)
+    for scale in [2.5,4.0,6.0,9.0]:
+        result=hough_detect(gray,min_r,max_r,cx,cy,plate_r*scale)
         if result:
-            rx, ry, rr = result
-            # Only check radius is plate-like — no distance check
-            if 0.45*plate_r < rr < 1.8*plate_r:
-                return result
+            _,_,rr=result
+            if 0.45*plate_r<rr<1.8*plate_r: return result
     return None
 
 def refine_center_radial(gray, cx, cy, r, n_rays=16):
-    h, w = gray.shape; eg=enhance(gray); edge_pts=[]; search=max(4,int(r*0.18))
+    h,w=gray.shape; eg=enhance(gray); edge_pts=[]; search=max(4,int(r*0.18))
     for i in range(n_rays):
         angle=np.radians(i*360.0/n_rays); dx=np.cos(angle); dy=np.sin(angle)
         ex_=cx+r*0.95*dx; ey_=cy+r*0.95*dy
@@ -100,26 +96,33 @@ def refine_center_radial(gray, cx, cy, r, n_rays=16):
     except: pass
     return cx,cy
 
-def seed_all_pts(gray, cx, cy, r):
-    eg=enhance(gray); mask=np.zeros(gray.shape,np.uint8)
-    cv2.circle(mask,(int(cx),int(cy)),int(max(4,r*0.88)),255,-1)
-    interior=cv2.goodFeaturesToTrack(eg,150,0.004,3,mask=mask,blockSize=7)
-    h,w=gray.shape; rim=[]
-    for i in range(48):
-        a=np.radians(i*7.5); px=cx+r*0.92*np.cos(a); py=cy+r*0.92*np.sin(a)
-        if 2<px<w-2 and 2<py<h-2: rim.append([[px,py]])
-    rim_arr=np.array(rim,dtype=np.float32) if rim else None
-    if interior is not None and len(interior)>=6:
-        return np.vstack([interior,rim_arr]) if rim_arr is not None else interior
-    grid=[]; step=max(2.0,r*0.22); dy=-r*0.75
-    while dy<=r*0.75:
-        dx=-r*0.75
-        while dx<=r*0.75:
-            if dx*dx+dy*dy<=r*r*0.56: grid.append([[cx+dx,cy+dy]])
+def seed_pts(gray, cx, cy, r):
+    """Interior features only — NO rim points. Rim points sit at the
+    plate-background boundary and contaminate the displacement median."""
+    eg=enhance(gray)
+    mask=np.zeros(gray.shape,np.uint8)
+    # Use 0.80x radius so all features are well inside the plate
+    cv2.circle(mask,(int(cx),int(cy)),int(max(4,r*0.80)),255,-1)
+    pts=cv2.goodFeaturesToTrack(eg,150,0.01,3,mask=mask,blockSize=7)
+    if pts is not None and len(pts)>=8: return pts
+    # Fallback grid
+    grid=[]; step=max(2.0,r*0.25); dy=-r*0.7
+    while dy<=r*0.7:
+        dx=-r*0.7
+        while dx<=r*0.7:
+            if dx*dx+dy*dy<=r*r*0.49: grid.append([[cx+dx,cy+dy]])
             dx+=step
         dy+=step
-    base=np.array(grid,dtype=np.float32) if grid else np.array([[[cx,cy]]],dtype=np.float32)
-    return np.vstack([base,rim_arr]) if rim_arr is not None else base
+    return np.array(grid,dtype=np.float32) if grid else np.array([[[cx,cy]]],dtype=np.float32)
+
+def filter_in_plate(p0, cx, cy, plate_r, margin=1.1):
+    """Discard any features that have drifted outside the plate circle.
+    This is the critical step that prevents background contamination."""
+    pts=p0.reshape(-1,2)
+    dists=np.sqrt((pts[:,0]-cx)**2+(pts[:,1]-cy)**2)
+    keep=dists<plate_r*margin
+    if keep.sum()>=4: return p0[keep]
+    return p0  # keep all if filter would leave too few
 
 def smooth_coords(xs,ys,window=5):
     if len(xs)<window: return xs,ys
@@ -148,12 +151,11 @@ def detect_reps(frames,min_frames=8):
         else: i+=1
     return merged
 
-# LK: slightly smaller window for speed at full resolution — still accurate with radial refinement
-LK = dict(winSize=(25,25), maxLevel=3,
-    criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT, 20, 0.01))
+LK=dict(winSize=(21,21),maxLevel=3,
+    criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT,20,0.01))
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"2.0.0"}
+def health(): return {"status":"ok","version":"2.1.0"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -175,7 +177,6 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             if not cap.isOpened(): yield json.dumps({"error":"Cannot open video"})+"\n"; return
             fps=cap.get(cv2.CAP_PROP_FPS) or 30.0
             total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            # Always process every frame — no skipping
             yield json.dumps({"meta":{"total_frames":total,"fps":fps}})+"\n"
             ret,f0=cap.read()
             if not ret: yield json.dumps({"error":"Cannot read first frame"})+"\n"; return
@@ -189,13 +190,12 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             if det is None: det=hough_detect(g0,min_r,max_r,wp//2,hp//2,min(wp,hp)//2)
             if det is None: det=(tx,ty,max(min_r*2,int(hp*0.09)))
             cx,cy,plate_r=det; plate_r=max(min_r,plate_r)
-            # Refine initial position using circle geometry
             cx,cy=refine_center_radial(g0,cx,cy,plate_r)
             px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
-            prev_gray=enhance(g0.copy()); p0=seed_all_pts(g0,cx,cy,plate_r); del g0
+            prev_gray=enhance(g0.copy()); p0=seed_pts(g0,cx,cy,plate_r); del g0
             results=[{"t":0.0,"x":round(cx/wp,5),"y":round(cy/hp,5)}]
             yield json.dumps({"frame":results[0]})+"\n"
-            frames_since_hough=0; HOUGH_EVERY=10
+            frames_since_hough=0; HOUGH_EVERY=10; MIN_FEATURES=30
             cap.set(cv2.CAP_PROP_POS_FRAMES,0); fn=0; last_t=0.0
 
             while True:
@@ -207,7 +207,6 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 t=msec_t if msec_t>last_t else fn/fps
                 curr_gray=enhance(raw_gray)
 
-                # Bidirectional LK on every single frame
                 p1,sf,_=cv2.calcOpticalFlowPyrLK(prev_gray,curr_gray,p0,None,**LK)
                 p0r,sb,_=cv2.calcOpticalFlowPyrLK(curr_gray,prev_gray,p1,None,**LK)
                 fb=np.abs(p0-p0r).reshape(-1,2).max(axis=1)
@@ -217,38 +216,34 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                     gn=p1[good]; go=p0[good]
                     raw_cx=float(np.clip(cx+float(np.median(gn[:,0,0]-go[:,0,0])),plate_r,wp-plate_r))
                     raw_cy=float(np.clip(cy+float(np.median(gn[:,0,1]-go[:,0,1])),plate_r,hp-plate_r))
-                    # Refine with circle geometry — this is the precision layer
                     cx,cy=refine_center_radial(raw_gray,raw_cx,raw_cy,plate_r)
                     p0=gn.reshape(-1,1,2)
+                    # ── CRITICAL: discard features that drifted onto background ──
+                    p0=filter_in_plate(p0,cx,cy,plate_r,margin=1.1)
                 else:
-                    # LK failed — search for the plate with no distance restriction
                     rd=hough_recover(raw_gray,cx,cy,plate_r)
                     if rd:
                         ncx,ncy,_=rd
                         cx,cy=refine_center_radial(raw_gray,ncx,ncy,plate_r)
-                        p0=seed_all_pts(raw_gray,cx,cy,plate_r); frames_since_hough=0
+                        p0=seed_pts(raw_gray,cx,cy,plate_r); frames_since_hough=0
 
-                # Replenish features before they get too low
+                # Replenish if needed after drift filter
                 if len(p0)<MIN_FEATURES:
-                    new_pts=seed_all_pts(raw_gray,cx,cy,plate_r)
+                    new_pts=seed_pts(raw_gray,cx,cy,plate_r)
                     if len(new_pts)>len(p0): p0=new_pts
 
-                # Regular Hough re-anchor to correct any slow drift
                 frames_since_hough+=1
                 if frames_since_hough>=HOUGH_EVERY:
                     frames_since_hough=0
                     rd=hough_detect(raw_gray,int(plate_r*0.65),int(plate_r*1.35),cx,cy,plate_r*2.8)
                     if rd:
                         ncx,ncy,rr=rd
-                        if 0.55*plate_r<rr<1.7*plate_r:
+                        if 0.55*plate_r<rr<1.7*plate_r and (ncx-cx)**2+(ncy-cy)**2<(plate_r*1.5)**2:
                             ncx,ncy=refine_center_radial(raw_gray,ncx,ncy,plate_r)
-                            # Only accept if close — scheduled anchors should be near current pos
-                            if (ncx-cx)**2+(ncy-cy)**2<(plate_r*1.5)**2:
-                                cx,cy=ncx,ncy
-                                plate_r=plate_r*0.92+rr*0.08
-                                px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
-                                new_pts=seed_all_pts(raw_gray,cx,cy,plate_r)
-                                if len(new_pts)>=4: p0=new_pts
+                            cx,cy=ncx,ncy
+                            plate_r=plate_r*0.92+rr*0.08
+                            px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
+                            p0=seed_pts(raw_gray,cx,cy,plate_r)
 
                 del raw_gray
                 frame_data={"t":round(t,4),"x":round(cx/wp,5),"y":round(cy/hp,5)}
