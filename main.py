@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="7.2.1")
+app = FastAPI(title="ForceTrack Bar Path API", version="7.3.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -122,7 +122,7 @@ def detect_reps(frames,min_frames=8):
     return merged
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"7.2.1"}
+def health(): return {"status":"ok","version":"7.3.1"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -141,6 +141,10 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             work=normalise_video(tmp)
             rot=get_rotation(work)
             cap=cv2.VideoCapture(work)
+            # Disable OpenCV auto-rotation so rotate_frame() is the single source of truth.
+            # Without this, some builds apply rotation from metadata in cap.read() AND
+            # rotate_frame() applies it again → double-rotation for iOS MOV files.
+            cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
             if not cap.isOpened(): yield json.dumps({"error":"Cannot open video"})+"\n"; return
             fps=cap.get(cv2.CAP_PROP_FPS) or 30.0
             total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -160,6 +164,16 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             if det is None: det=(tx,ty,max(min_r*2,int(hp*0.09)))
             cx,cy,plate_r=det; plate_r=max(min_r,plate_r)
             px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
+            # Pre-lift lock: suppress Hough oscillation between nearby rings while the bar
+            # is stationary. Any per-frame jump larger than ~1.7 m/s equivalent must persist
+            # for LOCK_DEBOUNCE consecutive frames before being accepted. Single-frame jumps
+            # (A→B→A oscillation) are rejected; sustained movement (bar genuinely lifting)
+            # passes. Lock deactivates permanently once real movement is confirmed.
+            lock_jump_thresh = plate_r * 0.25 * (30.0 / fps)  # fps-scaled ~1.7 m/s
+            lock_debounce    = 3   # frames of consistency required to accept a large jump
+            lock_active      = True
+            lock_candidate   = None  # (cx, cy) of candidate being debounced
+            lock_streak      = 0
 
             hist_data=build_hist(f0,cx,cy,plate_r)
             if hist_data is None: yield json.dumps({"error":"Could not build colour histogram"})+"\n"; return
@@ -176,8 +190,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             gate_enabled=ref_score>=20.0
             del f0,g0
 
-            results=[{"t":0.0,"x":round(cx/wp,5),"y":round(cy/hp,5)}]
-            yield json.dumps({"frame":results[0]})+"\n"
+            results=[]
             cap.set(cv2.CAP_PROP_POS_FRAMES,0); fn=0; last_t=0.0
             vx,vy=0.0,0.0; vel_hist=[]; bad_streak=0
 
@@ -213,6 +226,25 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                         if plate_bp_score(frame,hist,new_cx,new_cy,plate_r)<min_score:
                             found=None
 
+                # Pre-lift lock: while bar hasn't started moving, debounce large Hough
+                # jumps (A→B→A oscillation between two rings). A jump exceeding
+                # lock_jump_thresh must appear in the same location for lock_debounce
+                # consecutive frames before being accepted as a real position change.
+                if found and lock_active:
+                    nc_x,nc_y,_=found
+                    jd=((nc_x-cx)**2+(nc_y-cy)**2)**0.5
+                    if jd<=lock_jump_thresh:
+                        lock_candidate=None; lock_streak=0   # small step, accepted as-is
+                    elif (lock_candidate is not None and
+                          ((nc_x-lock_candidate[0])**2+(nc_y-lock_candidate[1])**2)**0.5<lock_jump_thresh):
+                        lock_streak+=1
+                        if lock_streak>=lock_debounce:
+                            lock_active=False   # confirmed sustained movement, release lock
+                        else:
+                            found=None          # not yet confirmed, suppress this frame
+                    else:
+                        lock_candidate=(nc_x,nc_y); lock_streak=1; found=None
+
                 if found:
                     new_cx,new_cy,_=found
                     vel_hist.append((new_cx-cx,new_cy-cy))
@@ -230,6 +262,9 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                     tw_x=max(0,int(pred_cx-cs_pad)); tw_y=max(0,int(pred_cy-cs_pad))
                     tw_w=min(wp-tw_x,cs_pad*2);      tw_h=min(hp-tw_y,cs_pad*2)
                     pos,_=camshift_step(frame,hist,(tw_x,tw_y,tw_w,tw_h))
+                    if pos:
+                        if lock_active and ((pos[0]-cx)**2+(pos[1]-cy)**2)**0.5>lock_jump_thresh:
+                            pos=None  # reject CamShift jump during pre-lift lock
                     if pos:
                         cx,cy=pos
                     else:
