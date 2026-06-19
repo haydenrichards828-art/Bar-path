@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="7.3.1")
+app = FastAPI(title="ForceTrack Bar Path API", version="7.3.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -122,11 +122,13 @@ def detect_reps(frames,min_frames=8):
     return merged
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"7.3.1"}
+def health(): return {"status":"ok","version":"7.3.2"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
-    tmp=tempfile.mktemp(suffix=".mp4")
+    ct=video.content_type or ""
+    ext=".webm" if "webm" in ct else ".mp4"
+    tmp=tempfile.mktemp(suffix=ext)
     try:
         data=await video.read()
         if len(data)>600*1024*1024: raise HTTPException(400,"Video too large")
