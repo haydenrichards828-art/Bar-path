@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="7.3.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="7.2.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -122,7 +122,7 @@ def detect_reps(frames,min_frames=8):
     return merged
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"7.3.0"}
+def health(): return {"status":"ok","version":"7.2.1"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -197,26 +197,19 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 # Search pad grows with speed but is capped at 3× plate radius so the
                 # search window never covers most of the frame and attracts wrong circles.
                 gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
-                # Search window: tighter base so the window at rest (speed≈0) is
-                # plate_r×2 diameter rather than 3×, reducing the chance Hough
-                # picks up a second plate, collar, or rack upright at rep tops.
-                search_pad=min(plate_r*2.0, plate_r*1.0+speed*2.0)
+                search_pad=min(plate_r*3.0, plate_r*1.5+speed*2.5)
                 found=hough_find(gray,int(plate_r*0.75),int(plate_r*1.25),
                                  pred_cx,pred_cy,search_pad)
 
-                if found:
+                # Appearance gate: only applied when (a) the plate histogram is
+                # discriminative (gate_enabled) and (b) Hough's result is suspiciously
+                # far from the predicted position (> 30% of plate radius). Close results
+                # are trusted unconditionally; far ones are verified against the plate
+                # histogram to block wrong-circle grabs (lifter's body, equipment).
+                if found and gate_enabled:
                     new_cx,new_cy,_=found
                     dist_from_pred=((new_cx-pred_cx)**2+(new_cy-pred_cy)**2)**0.5
-                    # Unconditional distance sanity — rejects wrong-plate grabs for ALL
-                    # plate colours (including black plates where gate_enabled=False).
-                    # Real Hough noise on the correct plate is ±5–10% of plate_r.
-                    # Threshold = 0.5×plate_r + 1.5×current_speed covers velocity-lag
-                    # overshoot at direction reversals without accepting jumps to other
-                    # objects. On rejection, falls through to CamShift / dead-reckoning.
-                    if dist_from_pred > plate_r*0.5 + speed*1.5:
-                        found=None
-                    # Appearance gate for coloured plates — extra check on non-close results
-                    elif gate_enabled and dist_from_pred>plate_r*0.3:
+                    if dist_from_pred>plate_r*0.3:
                         if plate_bp_score(frame,hist,new_cx,new_cy,plate_r)<min_score:
                             found=None
 
