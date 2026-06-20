@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="7.3.3")
+app = FastAPI(title="ForceTrack Bar Path API", version="7.3.4")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -101,11 +101,17 @@ def smooth_coords(xs,ys,window=5):
     h=w//2; xs_s[:h]=xs[:h]; xs_s[-h:]=xs[-h:]; ys_s[:h]=ys[:h]; ys_s[-h:]=ys[-h:]
     return xs_s.tolist(),ys_s.tolist()
 
-def detect_reps(frames,min_frames=8):
+def detect_reps(frames,min_frames=8,min_rom=0.03):
     if len(frames)<min_frames*2: return []
     ys=[f['y'] for f in frames]; ts=[f['t'] for f in frames]
     vel=[(ys[i]-ys[i-1])/max(ts[i]-ts[i-1],0.001) for i in range(1,len(ys))]
-    vel=[vel[0]]+vel; svel=np.convolve(vel,np.ones(5)/5,mode='same').tolist()
+    vel=[vel[0]]+vel
+    # Replicate-pad (not zero-pad) so boundary frames don't get artificially pulled
+    # toward zero velocity — zero-pad creates phantom direction changes at sequence
+    # edges that shift rep boundaries when re-encoding changes the frame count by 1-2.
+    pad=2
+    padded=[vel[0]]*pad+vel+[vel[-1]]*pad
+    svel=np.convolve(padded,np.ones(5)/5,mode='valid').tolist()
     reps=[]; direction=None; rep_start=0
     for i,v in enumerate(svel):
         if abs(v)<0.002: continue
@@ -119,10 +125,14 @@ def detect_reps(frames,min_frames=8):
         if reps[i]['phase']=='down' and reps[i+1]['phase']=='up':
             merged.append({'start':reps[i]['start'],'end':reps[i+1]['end']}); i+=2
         else: i+=1
-    return merged
+    # Drop bar-oscillation micro-reps: settling/bounce at turnarounds looks like a
+    # direction change but has <3% of frame-height ROM. Real reps are 25-40% of
+    # frame height; noise tops out at ~2%. The 10× margin makes this threshold robust.
+    return [r for r in merged
+            if (max(ys[r['start']:r['end']+1])-min(ys[r['start']:r['end']+1]))>=min_rom]
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"7.3.3"}
+def health(): return {"status":"ok","version":"7.3.4"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
