@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="7.3.4")
+app = FastAPI(title="ForceTrack Bar Path API", version="7.3.6")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -42,7 +42,7 @@ def rotate_frame(frame, rot):
     if rot==270: return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     return frame
 
-def hough_find(gray, min_r, max_r, cx_hint, cy_hint, pad):
+def hough_find(gray, min_r, max_r, cx_hint, cy_hint, pad, prefer_largest=False):
     h,w=gray.shape
     sx=max(0,int(cx_hint-pad)); sy=max(0,int(cy_hint-pad))
     ex=min(w,int(cx_hint+pad)); ey=min(h,int(cy_hint+pad))
@@ -51,7 +51,15 @@ def hough_find(gray, min_r, max_r, cx_hint, cy_hint, pad):
     for p2 in [30,24,18,12,8,5]:
         c=cv2.HoughCircles(b,cv2.HOUGH_GRADIENT,1.2,(ey-sy)//2,param1=80,param2=p2,minRadius=min_r,maxRadius=max_r)
         if c is not None:
-            best=min(c[0],key=lambda v:(v[0]+sx-cx_hint)**2+(v[1]+sy-cy_hint)**2)
+            if prefer_largest:
+                # Initial detection: among circles that contain the tap point, pick the
+                # largest. This prevents a small inner ring (closer to tap) beating the
+                # true outer plate edge when the user taps away from the plate center.
+                inside=[v for v in c[0] if (v[0]+sx-cx_hint)**2+(v[1]+sy-cy_hint)**2<=v[2]**2]
+                pool=inside if inside else list(c[0])
+                best=max(pool,key=lambda v:v[2])
+            else:
+                best=min(c[0],key=lambda v:(v[0]+sx-cx_hint)**2+(v[1]+sy-cy_hint)**2)
             return float(best[0]+sx),float(best[1]+sy),float(best[2])
     return None
 
@@ -132,7 +140,7 @@ def detect_reps(frames,min_frames=8,min_rom=0.03):
             if (max(ys[r['start']:r['end']+1])-min(ys[r['start']:r['end']+1]))>=min_rom]
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"7.3.4"}
+def health(): return {"status":"ok","version":"7.3.6"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -171,8 +179,8 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             # Radius range tuned to a single bumper plate: 5–30% of the shorter frame side
             short_side=min(wp,hp)
             min_r=max(10,int(short_side*0.05)); max_r=int(short_side*0.30)
-            det=hough_find(g0,min_r,max_r,tx,ty,int(short_side*0.35))
-            if det is None: det=hough_find(g0,min_r,max_r,wp//2,hp//2,min(wp,hp)//2)
+            det=hough_find(g0,min_r,max_r,tx,ty,int(short_side*0.35),prefer_largest=True)
+            if det is None: det=hough_find(g0,min_r,max_r,wp//2,hp//2,min(wp,hp)//2,prefer_largest=True)
             if det is None: det=(tx,ty,max(min_r*2,int(hp*0.09)))
             cx,cy,plate_r=det; plate_r=max(min_r,plate_r)
             px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
@@ -206,6 +214,10 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             results=[]
             cap.set(cv2.CAP_PROP_POS_FRAMES,0); fn=0; last_t=0.0
             vx,vy=0.0,0.0; vel_hist=[]; bad_streak=0
+            # Adaptive radius: slow EMA of detected radii so the Hough search band
+            # tracks perspective growth (plate appears larger as bar moves closer).
+            # Clamped to [0.65, 1.40]×plate_r so one bad detection can't derail the band.
+            current_r=float(plate_r)
 
             while True:
                 ret,frame=cap.read()
@@ -223,8 +235,8 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 # Search pad grows with speed but is capped at 3× plate radius so the
                 # search window never covers most of the frame and attracts wrong circles.
                 gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
-                search_pad=min(plate_r*3.0, plate_r*1.5+speed*2.5)
-                found=hough_find(gray,int(plate_r*0.75),int(plate_r*1.25),
+                search_pad=min(current_r*3.0, current_r*1.5+speed*2.5)
+                found=hough_find(gray,int(current_r*0.75),int(current_r*1.25),
                                  pred_cx,pred_cy,search_pad)
 
                 # Appearance gate: only applied when (a) the plate histogram is
@@ -235,7 +247,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 if found and gate_enabled:
                     new_cx,new_cy,_=found
                     dist_from_pred=((new_cx-pred_cx)**2+(new_cy-pred_cy)**2)**0.5
-                    if dist_from_pred>plate_r*0.3:
+                    if dist_from_pred>current_r*0.3:
                         if plate_bp_score(frame,hist,new_cx,new_cy,plate_r)<min_score:
                             found=None
 
@@ -265,7 +277,8 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                         lock_candidate=(nc_x,nc_y); lock_streak=1; found=None
 
                 if found:
-                    new_cx,new_cy,_=found
+                    new_cx,new_cy,new_r=found
+                    current_r=max(plate_r*0.65,min(plate_r*1.40,current_r*0.93+new_r*0.07))
                     vel_hist.append((new_cx-cx,new_cy-cy))
                     if len(vel_hist)>3: vel_hist.pop(0)
                     vx=sum(v[0] for v in vel_hist)/len(vel_hist)
