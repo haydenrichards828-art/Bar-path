@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="7.3.2")
+app = FastAPI(title="ForceTrack Bar Path API", version="7.3.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -122,7 +122,7 @@ def detect_reps(frames,min_frames=8):
     return merged
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"7.3.2"}
+def health(): return {"status":"ok","version":"7.3.3"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
@@ -176,6 +176,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             lock_active      = True
             lock_candidate   = None  # (cx, cy) of candidate being debounced
             lock_streak      = 0
+            lock_origin_cx, lock_origin_cy = cx, cy  # initial detection position
 
             hist_data=build_hist(f0,cx,cy,plate_r)
             if hist_data is None: yield json.dumps({"error":"Could not build colour histogram"})+"\n"; return
@@ -232,10 +233,16 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 # jumps (A→B→A oscillation between two rings). A jump exceeding
                 # lock_jump_thresh must appear in the same location for lock_debounce
                 # consecutive frames before being accepted as a real position change.
+                # Travel exit: once the plate has moved >1.5× plate_r from the initial
+                # detection, the bar is genuinely lifting — oscillation is impossible at
+                # that distance, so the lock is released immediately.
                 if found and lock_active:
                     nc_x,nc_y,_=found
                     jd=((nc_x-cx)**2+(nc_y-cy)**2)**0.5
-                    if jd<=lock_jump_thresh:
+                    travel=((nc_x-lock_origin_cx)**2+(nc_y-lock_origin_cy)**2)**0.5
+                    if travel>plate_r*1.5:
+                        lock_active=False       # bar has left the pre-lift zone
+                    elif jd<=lock_jump_thresh:
                         lock_candidate=None; lock_streak=0   # small step, accepted as-is
                     elif (lock_candidate is not None and
                           ((nc_x-lock_candidate[0])**2+(nc_y-lock_candidate[1])**2)**0.5<lock_jump_thresh):
