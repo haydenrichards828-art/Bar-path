@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="7.3.6")
+app = FastAPI(title="ForceTrack Bar Path API", version="7.3.7")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -226,9 +226,12 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 msec_t=cap.get(cv2.CAP_PROP_POS_MSEC)/1000.0
                 t=msec_t if msec_t>last_t else fn/fps
 
-                # Velocity-predicted position for this frame
-                pred_cx=max(plate_r,min(wp-plate_r,cx+vx))
-                pred_cy=max(plate_r,min(hp-plate_r,cy+vy))
+                # Velocity-predicted position for this frame. Clamped with a small fixed
+                # margin (not plate_r) so the search centre stays in-frame without
+                # artificially preventing the plate from being tracked near frame edges.
+                # plate_r is large after v7.3.6 (~234px) and would clip valid positions.
+                pred_cx=max(20,min(wp-20,cx+vx))
+                pred_cy=max(20,min(hp-20,cy+vy))
                 speed=(vx**2+vy**2)**0.5
 
                 # Primary: Hough every frame, searched around the predicted position.
