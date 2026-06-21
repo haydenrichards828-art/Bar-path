@@ -140,7 +140,7 @@ def detect_reps(frames,min_frames=8,min_rom=0.03):
             if (max(ys[r['start']:r['end']+1])-min(ys[r['start']:r['end']+1]))>=min_rom]
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"7.3.6"}
+def health(): return {"status":"ok","version":app.version}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
