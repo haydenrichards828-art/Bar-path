@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="7.3.7")
+app = FastAPI(title="ForceTrack Bar Path API", version="7.3.8")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -216,7 +216,8 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             vx,vy=0.0,0.0; vel_hist=[]; bad_streak=0
             # Adaptive radius: slow EMA of detected radii so the Hough search band
             # tracks perspective growth (plate appears larger as bar moves closer).
-            # Clamped to [0.65, 1.40]×plate_r so one bad detection can't derail the band.
+            # Clamped to [0.85, 1.15]×plate_r — tight enough to prevent positive feedback
+            # (wide clamp let current_r drift to 1.40× cap, excluding the outer plate from search).
             current_r=float(plate_r)
 
             while True:
@@ -281,7 +282,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
 
                 if found:
                     new_cx,new_cy,new_r=found
-                    current_r=max(plate_r*0.65,min(plate_r*1.40,current_r*0.93+new_r*0.07))
+                    current_r=max(plate_r*0.85,min(plate_r*1.15,current_r*0.93+new_r*0.07))
                     vel_hist.append((new_cx-cx,new_cy-cy))
                     if len(vel_hist)>3: vel_hist.pop(0)
                     vx=sum(v[0] for v in vel_hist)/len(vel_hist)
