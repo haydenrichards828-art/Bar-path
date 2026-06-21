@@ -1,4 +1,4 @@
-import os, cv2, numpy as np, tempfile, subprocess, json, asyncio
+import os, cv2, numpy as np, tempfile, subprocess, json, asyncio, hashlib
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -150,6 +150,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
     try:
         data=await video.read()
         if len(data)>600*1024*1024: raise HTTPException(400,"Video too large")
+        print(f"[analyze] recv sha={hashlib.sha256(data).hexdigest()[:16]} size={len(data)} params={params!r}", flush=True)
         with open(tmp,"wb") as f: f.write(data)
         del data
     except HTTPException: raise
@@ -183,6 +184,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             if det is None: det=hough_find(g0,min_r,max_r,wp//2,hp//2,min(wp,hp)//2,prefer_largest=True)
             if det is None: det=(tx,ty,max(min_r*2,int(hp*0.09)))
             cx,cy,plate_r=det; plate_r=max(min_r,plate_r)
+            print(f"[analyze] init cx={cx:.2f} cy={cy:.2f} plate_r={plate_r:.2f} tx={tx:.2f} ty={ty:.2f}", flush=True)
             px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
             # Pre-lift lock: suppress Hough oscillation between nearby rings while the bar
             # is stationary. Any per-frame jump larger than ~1.7 m/s equivalent must persist
