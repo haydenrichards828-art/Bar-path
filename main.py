@@ -213,7 +213,32 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             gate_enabled=ref_score>=20.0
             del f0,g0
 
+            # Stable initial anchor: average Hough across first N_ANCHOR frames while the
+            # bar is still static. More robust than frame-0 alone against intra-frame
+            # compression artifacts (HEVC/H.264 keyframe ringing) that can shift the
+            # detected center by 5-15 px and cause run-to-run ROM/velocity inconsistency.
+            # Only includes detections within 0.5×plate_r of the initial fix to exclude
+            # frames where Hough has already drifted onto a wrong circle.
+            N_ANCHOR = 10
+            _anchor_acc = [(cx, cy)]   # frame-0 detection already done above
+            for _ai in range(N_ANCHOR - 1):
+                ret_a, fa = cap.read()
+                if not ret_a: break
+                fa = rotate_frame(fa, rot)
+                ga = cv2.cvtColor(fa, cv2.COLOR_BGR2GRAY)
+                det_a = hough_find(ga, min_r, max_r, cx, cy, int(short_side * 0.35))
+                if det_a is not None:
+                    acx, acy, _ = det_a
+                    if ((acx - cx) ** 2 + (acy - cy) ** 2) ** 0.5 < plate_r * 0.5:
+                        _anchor_acc.append((acx, acy))
+            cx = sum(d[0] for d in _anchor_acc) / len(_anchor_acc)
+            cy = sum(d[1] for d in _anchor_acc) / len(_anchor_acc)
+            print(f"[analyze] anchor cx={cx:.2f} cy={cy:.2f} n={len(_anchor_acc)}/{N_ANCHOR}", flush=True)
+            del _anchor_acc
+            lock_origin_cx, lock_origin_cy = cx, cy   # anchor overrides initial-only detection
+
             results=[]
+            _anchor_cx, _anchor_cy = cx, cy   # saved for explicit frame-0 output lock
             cap.set(cv2.CAP_PROP_POS_FRAMES,0); fn=0; last_t=0.0
             vx,vy=0.0,0.0; vel_hist=[]; bad_streak=0
             # Adaptive radius: slow EMA of detected radii so the Hough search band
@@ -311,6 +336,12 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                         vx*=0.97; vy*=0.97
                         cx,cy=pred_cx,pred_cy
 
+                # Frame-0 output lock: the first emitted frame must always carry the
+                # stable anchor position (true Hough plate center, tap-position-free)
+                # regardless of what the per-frame Hough finds here. This guarantees
+                # the dot is at the geometric plate center from the first rendered frame.
+                if fn == 0:
+                    cx, cy = _anchor_cx, _anchor_cy
                 frame_data={"t":round(t,4),"x":round(cx/wp,5),"y":round(cy/hp,5)}
                 results.append(frame_data); yield json.dumps({"frame":frame_data})+"\n"
                 fn+=1; last_t=t
