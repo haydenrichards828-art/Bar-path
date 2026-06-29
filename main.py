@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="7.3.10")
+app = FastAPI(title="ForceTrack Bar Path API", version="7.3.8")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -186,7 +186,6 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             cx,cy,plate_r=det; plate_r=max(min_r,plate_r)
             print(f"[analyze] init cx={cx:.2f} cy={cy:.2f} plate_r={plate_r:.2f} tx={tx:.2f} ty={ty:.2f}", flush=True)
             px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
-            max_phys_disp=px_per_m*5.0/fps   # 5 m/s cap — physically impossible for a barbell
             # Pre-lift lock: suppress Hough oscillation between nearby rings while the bar
             # is stationary. Any per-frame jump larger than ~1.7 m/s equivalent must persist
             # for LOCK_DEBOUNCE consecutive frames before being accepted. Single-frame jumps
@@ -214,32 +213,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             gate_enabled=ref_score>=20.0
             del f0,g0
 
-            # Stable initial anchor: average Hough across first N_ANCHOR frames while the
-            # bar is still static. More robust than frame-0 alone against intra-frame
-            # compression artifacts (HEVC/H.264 keyframe ringing) that can shift the
-            # detected center by 5-15 px and cause run-to-run ROM/velocity inconsistency.
-            # Only includes detections within 0.5×plate_r of the initial fix to exclude
-            # frames where Hough has already drifted onto a wrong circle.
-            N_ANCHOR = 10
-            _anchor_acc = [(cx, cy)]   # frame-0 detection already done above
-            for _ai in range(N_ANCHOR - 1):
-                ret_a, fa = cap.read()
-                if not ret_a: break
-                fa = rotate_frame(fa, rot)
-                ga = cv2.cvtColor(fa, cv2.COLOR_BGR2GRAY)
-                det_a = hough_find(ga, min_r, max_r, cx, cy, int(short_side * 0.35))
-                if det_a is not None:
-                    acx, acy, _ = det_a
-                    if ((acx - cx) ** 2 + (acy - cy) ** 2) ** 0.5 < plate_r * 0.5:
-                        _anchor_acc.append((acx, acy))
-            cx = sum(d[0] for d in _anchor_acc) / len(_anchor_acc)
-            cy = sum(d[1] for d in _anchor_acc) / len(_anchor_acc)
-            print(f"[analyze] anchor cx={cx:.2f} cy={cy:.2f} n={len(_anchor_acc)}/{N_ANCHOR}", flush=True)
-            del _anchor_acc
-            lock_origin_cx, lock_origin_cy = cx, cy   # anchor overrides initial-only detection
-
             results=[]
-            _anchor_cx, _anchor_cy = cx, cy   # saved for explicit frame-0 output lock
             cap.set(cv2.CAP_PROP_POS_FRAMES,0); fn=0; last_t=0.0
             vx,vy=0.0,0.0; vel_hist=[]; bad_streak=0
             # Adaptive radius: slow EMA of detected radii so the Hough search band
@@ -249,13 +223,11 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             current_r=float(plate_r)
 
             while True:
-                msec_before=cap.get(cv2.CAP_PROP_POS_MSEC)/1000.0  # PTS of frame about to be read
                 ret,frame=cap.read()
                 if not ret: break
                 frame=rotate_frame(frame,rot)
-                msec_after=cap.get(cv2.CAP_PROP_POS_MSEC)/1000.0   # PTS of NEXT frame (off by 1)
-                t=msec_before if (fn==0 or msec_before>last_t) else fn/fps
-                if fn<10: print(f"[ts-diag] fn={fn} before={msec_before:.4f} after={msec_after:.4f} fn/fps={fn/fps:.4f} t={t:.4f}",flush=True)
+                msec_t=cap.get(cv2.CAP_PROP_POS_MSEC)/1000.0
+                t=msec_t if msec_t>last_t else fn/fps
 
                 # Velocity-predicted position for this frame. Clamped with a small fixed
                 # margin (not plate_r) so the search centre stays in-frame without
@@ -311,13 +283,6 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                         lock_candidate=(nc_x,nc_y); lock_streak=1; found=None
 
                 if found:
-                    nc_x,nc_y,_=found
-                    d=((nc_x-cx)**2+(nc_y-cy)**2)**0.5
-                    if d>max_phys_disp:
-                        print(f"[phys_cap] fn={fn} disp={d:.1f}px > {max_phys_disp:.1f}px rejected",flush=True)
-                        found=None
-
-                if found:
                     new_cx,new_cy,new_r=found
                     current_r=max(plate_r*0.85,min(plate_r*1.15,current_r*0.93+new_r*0.07))
                     vel_hist.append((new_cx-cx,new_cy-cy))
@@ -332,7 +297,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                     # CamShift to prevent drift compounding.
                     bad_streak+=1
                     cs_pad=int(search_pad)
-                    tw_x=max(0,int(cx-cs_pad)); tw_y=max(0,int(cy-cs_pad))
+                    tw_x=max(0,int(pred_cx-cs_pad)); tw_y=max(0,int(pred_cy-cs_pad))
                     tw_w=min(wp-tw_x,cs_pad*2);      tw_h=min(hp-tw_y,cs_pad*2)
                     pos,_=camshift_step(frame,hist,(tw_x,tw_y,tw_w,tw_h))
                     if pos:
@@ -346,12 +311,6 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                         vx*=0.97; vy*=0.97
                         cx,cy=pred_cx,pred_cy
 
-                # Frame-0 output lock: the first emitted frame must always carry the
-                # stable anchor position (true Hough plate center, tap-position-free)
-                # regardless of what the per-frame Hough finds here. This guarantees
-                # the dot is at the geometric plate center from the first rendered frame.
-                if fn == 0:
-                    cx, cy = _anchor_cx, _anchor_cy
                 frame_data={"t":round(t,4),"x":round(cx/wp,5),"y":round(cy/hp,5)}
                 results.append(frame_data); yield json.dumps({"frame":frame_data})+"\n"
                 fn+=1; last_t=t
