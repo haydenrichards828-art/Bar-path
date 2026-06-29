@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="7.3.11")
+app = FastAPI(title="ForceTrack Bar Path API", version="7.3.8")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -186,11 +186,6 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             cx,cy,plate_r=det; plate_r=max(min_r,plate_r)
             print(f"[analyze] init cx={cx:.2f} cy={cy:.2f} plate_r={plate_r:.2f} tx={tx:.2f} ty={ty:.2f}", flush=True)
             px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
-            # Hard physical cap: no loaded barbell moves faster than 5 m/s; any Hough
-            # or CamShift result farther than this from the last accepted position is a
-            # wrong-circle grab (adjacent plate ring, hub, background equipment).
-            # At 5 m/s the cap is 173 px/frame at 30 fps for a standard 45 cm plate.
-            max_phys_disp = px_per_m * 5.0 / fps
             # Pre-lift lock: suppress Hough oscillation between nearby rings while the bar
             # is stationary. Any per-frame jump larger than ~1.7 m/s equivalent must persist
             # for LOCK_DEBOUNCE consecutive frames before being accepted. Single-frame jumps
@@ -287,39 +282,6 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                         if plate_bp_score(frame,hist,new_cx,new_cy,plate_r)<min_score:
                             found=None
 
-                # Physical plausibility cap: reject any Hough result that implies bar
-                # speed > 5 m/s (max_phys_disp px/frame). Catches wrong-circle oscillation
-                # where the search window — centered on a stale velocity prediction — picks
-                # an adjacent ring or background circle 250-400 px away instead of the
-                # plate, contaminating vel_hist and causing alternating lag/lead errors.
-                if found:
-                    nc_x,nc_y,_=found
-                    if ((nc_x-cx)**2+(nc_y-cy)**2)**0.5>max_phys_disp:
-                        print(f"[phys_cap] fn={fn} disp={((nc_x-cx)**2+(nc_y-cy)**2)**0.5:.0f}px "
-                              f"> cap {max_phys_disp:.0f}px, rejected",flush=True)
-                        found=None
-
-                # Direction consistency: reject Hough results that are almost exactly
-                # opposite to the current velocity direction (angle > 150°). Catches
-                # wrong circles on the far side of the bar at physically-plausible
-                # distances — the distance cap alone misses these because they are
-                # within the 5 m/s bound but going directly backward.
-                # Only active once vel_hist is full (3 frames) so the velocity
-                # direction estimate is stable. Skipped at low speed so it never
-                # fires during legitimate turnarounds where velocity is nearly zero.
-                if found and len(vel_hist)>=3:
-                    nc_x,nc_y,_=found
-                    disp_x=nc_x-cx; disp_y=nc_y-cy
-                    vel_mag2=vx*vx+vy*vy; disp_mag2=disp_x*disp_x+disp_y*disp_y
-                    _vmin2=(plate_r*0.15)**2  # skip if speed < 15% plate_r per frame
-                    _dmin2=(plate_r*0.05)**2  # skip if displacement < 5% plate_r
-                    if vel_mag2>_vmin2 and disp_mag2>_dmin2:
-                        dot=disp_x*vx+disp_y*vy
-                        if dot<0 and dot*dot>0.75*vel_mag2*disp_mag2:  # angle > 150°
-                            print(f"[dir_check] fn={fn} disp={disp_mag2**0.5:.0f}px "
-                                  f"angle>150deg rejected",flush=True)
-                            found=None
-
                 # Pre-lift lock: while bar hasn't started moving, debounce large Hough
                 # jumps (A→B→A oscillation between two rings). A jump exceeding
                 # lock_jump_thresh must appear in the same location for lock_debounce
@@ -354,24 +316,18 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                     vy=sum(v[1] for v in vel_hist)/len(vel_hist)
                     cx,cy=new_cx,new_cy; bad_streak=0
                 else:
-                    # Fallback: CamShift anchored to the CURRENT accepted position (cx,cy),
-                    # not the velocity-predicted position. After a physical-cap rejection
-                    # vel_hist may be partially corrupted by earlier borderline wrong circles
-                    # that passed the cap; centering on cx rather than pred keeps the search
-                    # window over the real plate. search_pad at high speed is plate_r×3
-                    # (~700 px), wide enough to cover any physically reachable position from
-                    # cx without needing a velocity offset. Velocity is NOT updated from
+                    # Fallback: CamShift anchored to predicted position.
+                    # Use the same search region as Hough would have so it can reach a
+                    # fast-moving plate that Hough missed. Velocity is NOT updated from
                     # CamShift to prevent drift compounding.
                     bad_streak+=1
                     cs_pad=int(search_pad)
-                    tw_x=max(0,int(cx-cs_pad)); tw_y=max(0,int(cy-cs_pad))
-                    tw_w=min(wp-tw_x,cs_pad*2); tw_h=min(hp-tw_y,cs_pad*2)
+                    tw_x=max(0,int(pred_cx-cs_pad)); tw_y=max(0,int(pred_cy-cs_pad))
+                    tw_w=min(wp-tw_x,cs_pad*2);      tw_h=min(hp-tw_y,cs_pad*2)
                     pos,_=camshift_step(frame,hist,(tw_x,tw_y,tw_w,tw_h))
                     if pos:
                         if lock_active and ((pos[0]-cx)**2+(pos[1]-cy)**2)**0.5>lock_jump_thresh:
                             pos=None  # reject CamShift jump during pre-lift lock
-                        elif ((pos[0]-cx)**2+(pos[1]-cy)**2)**0.5>max_phys_disp:
-                            pos=None  # CamShift drifted beyond physical bounds
                     if pos:
                         cx,cy=pos
                     else:
