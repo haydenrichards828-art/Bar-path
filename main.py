@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="7.3.8")
+app = FastAPI(title="ForceTrack Bar Path API", version="7.3.10")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
@@ -248,11 +248,13 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             current_r=float(plate_r)
 
             while True:
+                msec_before=cap.get(cv2.CAP_PROP_POS_MSEC)/1000.0  # PTS of frame about to be read
                 ret,frame=cap.read()
                 if not ret: break
                 frame=rotate_frame(frame,rot)
-                msec_t=cap.get(cv2.CAP_PROP_POS_MSEC)/1000.0
-                t=msec_t if msec_t>last_t else fn/fps
+                msec_after=cap.get(cv2.CAP_PROP_POS_MSEC)/1000.0   # PTS of NEXT frame (off by 1)
+                t=msec_before if (fn==0 or msec_before>last_t) else fn/fps
+                if fn<10: print(f"[ts-diag] fn={fn} before={msec_before:.4f} after={msec_after:.4f} fn/fps={fn/fps:.4f} t={t:.4f}",flush=True)
 
                 # Velocity-predicted position for this frame. Clamped with a small fixed
                 # margin (not plate_r) so the search centre stays in-frame without
