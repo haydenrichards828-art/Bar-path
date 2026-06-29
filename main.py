@@ -186,6 +186,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             cx,cy,plate_r=det; plate_r=max(min_r,plate_r)
             print(f"[analyze] init cx={cx:.2f} cy={cy:.2f} plate_r={plate_r:.2f} tx={tx:.2f} ty={ty:.2f}", flush=True)
             px_per_m=plate_r/(PLATE_DIAMETER_M/2.0)
+            max_phys_disp=px_per_m*5.0/fps   # 5 m/s cap — physically impossible for a barbell
             # Pre-lift lock: suppress Hough oscillation between nearby rings while the bar
             # is stationary. Any per-frame jump larger than ~1.7 m/s equivalent must persist
             # for LOCK_DEBOUNCE consecutive frames before being accepted. Single-frame jumps
@@ -310,6 +311,13 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                         lock_candidate=(nc_x,nc_y); lock_streak=1; found=None
 
                 if found:
+                    nc_x,nc_y,_=found
+                    d=((nc_x-cx)**2+(nc_y-cy)**2)**0.5
+                    if d>max_phys_disp:
+                        print(f"[phys_cap] fn={fn} disp={d:.1f}px > {max_phys_disp:.1f}px rejected",flush=True)
+                        found=None
+
+                if found:
                     new_cx,new_cy,new_r=found
                     current_r=max(plate_r*0.85,min(plate_r*1.15,current_r*0.93+new_r*0.07))
                     vel_hist.append((new_cx-cx,new_cy-cy))
@@ -324,7 +332,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                     # CamShift to prevent drift compounding.
                     bad_streak+=1
                     cs_pad=int(search_pad)
-                    tw_x=max(0,int(pred_cx-cs_pad)); tw_y=max(0,int(pred_cy-cs_pad))
+                    tw_x=max(0,int(cx-cs_pad)); tw_y=max(0,int(cy-cs_pad))
                     tw_w=min(wp-tw_x,cs_pad*2);      tw_h=min(hp-tw_y,cs_pad*2)
                     pos,_=camshift_step(frame,hist,(tw_x,tw_y,tw_w,tw_h))
                     if pos:
