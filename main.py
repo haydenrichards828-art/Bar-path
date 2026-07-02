@@ -228,6 +228,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 frame=rotate_frame(frame,rot)
                 msec_t=cap.get(cv2.CAP_PROP_POS_MSEC)/1000.0
                 t=msec_t if msec_t>last_t else fn/fps
+                if fn<3: print(f"[ts-check] frame {fn}: t={t:.4f}s  fps={fps:.1f}",flush=True)
 
                 # Velocity-predicted position for this frame. Clamped with a small fixed
                 # margin (not plate_r) so the search centre stays in-frame without
