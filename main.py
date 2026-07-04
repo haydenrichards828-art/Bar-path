@@ -175,6 +175,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             ret,f0=cap.read()
             if not ret: yield json.dumps({"error":"Cannot read first frame"})+"\n"; return
             f0=rotate_frame(f0,rot); raw_h,raw_w=f0.shape[:2]; wp,hp=raw_w,raw_h
+            _ds=min(1.0,540.0/min(wp,hp))
             g0=cv2.cvtColor(f0,cv2.COLOR_BGR2GRAY)
             try: p=json.loads(params)
             except: p={}
@@ -245,8 +246,14 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 # search window never covers most of the frame and attracts wrong circles.
                 gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
                 search_pad=min(current_r*3.0, current_r*1.5+speed*2.5)
-                found=hough_find(gray,int(current_r*0.75),int(current_r*1.25),
-                                 pred_cx,pred_cy,search_pad)
+                if _ds<1.0:
+                    gray_s=cv2.resize(gray,None,fx=_ds,fy=_ds)
+                    found_s=hough_find(gray_s,max(3,int(current_r*0.75*_ds)),int(current_r*1.25*_ds),
+                                       pred_cx*_ds,pred_cy*_ds,search_pad*_ds)
+                    found=(found_s[0]/_ds,found_s[1]/_ds,found_s[2]/_ds) if found_s else None
+                else:
+                    found=hough_find(gray,int(current_r*0.75),int(current_r*1.25),
+                                     pred_cx,pred_cy,search_pad)
 
                 # Appearance gate: only applied when (a) the plate histogram is
                 # discriminative (gate_enabled) and (b) Hough's result is suspiciously
