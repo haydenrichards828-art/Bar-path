@@ -1,7 +1,7 @@
-import os, cv2, numpy as np, tempfile, subprocess, json, asyncio, hashlib
+import os, cv2, numpy as np, tempfile, subprocess, json, asyncio, hashlib, secrets
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI(title="ForceTrack Bar Path API", version="7.3.8")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -102,13 +102,6 @@ def camshift_step(bgr_frame, hist, track_window):
     cx=x+w/2.0; cy=y+h/2.0
     return (cx,cy),new_window
 
-def smooth_coords(xs,ys,window=5):
-    if len(xs)<window: return xs,ys
-    w=window if window%2==1 else window+1; k=np.ones(w)/w
-    xs_s=np.convolve(xs,k,mode='same'); ys_s=np.convolve(ys,k,mode='same')
-    h=w//2; xs_s[:h]=xs[:h]; xs_s[-h:]=xs[-h:]; ys_s[:h]=ys[:h]; ys_s[-h:]=ys[-h:]
-    return xs_s.tolist(),ys_s.tolist()
-
 def detect_reps(frames,min_frames=8,min_rom=0.03):
     if len(frames)<min_frames*2: return []
     xs=[f['x'] for f in frames]; ys=[f['y'] for f in frames]; ts=[f['t'] for f in frames]
@@ -146,6 +139,8 @@ def health(): return {"status":"ok","version":app.version}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
+    if not secrets.compare_digest(api_key or "", os.environ.get("ANALYZE_KEY", "")):
+        return JSONResponse({"error":"unauthorized"}, status_code=401)
     ct=video.content_type or ""
     ext=".webm" if "webm" in ct else ".mp4"
     tmp=tempfile.mktemp(suffix=ext)
@@ -327,11 +322,11 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 if fn%30==0: await asyncio.sleep(0)
 
             cap.release()
-            if results:
-                pass  # smooth_coords removed: caused 12-17px amplitude compression and
-                      # 1-2 frame temporal displacement at turnarounds, making the dot
-                      # appear to reverse before the bar does. Hough jitter at rest is
-                      # only ~7px (imperceptible), so smoothing is net harmful.
+            # Coordinates are intentionally unsmoothed: smoothing caused 12-17px
+            # amplitude compression and 1-2 frame temporal displacement at
+            # turnarounds, making the dot appear to reverse before the bar does.
+            # Hough jitter at rest is only ~7px (imperceptible), so smoothing is
+            # net harmful.
             reps=detect_reps(results); rep_metrics=[]
             for rep in reps:
                 seg=results[rep['start']:rep['end']+1]
