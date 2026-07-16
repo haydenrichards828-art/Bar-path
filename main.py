@@ -1,10 +1,10 @@
-import os, cv2, numpy as np, tempfile, subprocess
+import os, cv2, numpy as np, tempfile, subprocess, secrets
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 app = FastAPI(title="ForceTrack Bar Path API", version="0.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-VALID_KEY = os.environ.get("BARPATH_API_KEY", "")
 
 def get_rotation(path):
     try:
@@ -78,8 +78,10 @@ def health(): return {"status":"ok","version":"0.3.0"}
 
 @app.post("/analyze")
 async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
-    if VALID_KEY and api_key != VALID_KEY:
-        raise HTTPException(401, "Invalid API key")
+    # ANALYZE_KEY takes priority; falls back to BARPATH_API_KEY so existing
+    # Railway/Netlify env vars keep working until ANALYZE_KEY is set.
+    if not secrets.compare_digest(api_key or "", os.environ.get("ANALYZE_KEY", os.environ.get("BARPATH_API_KEY", ""))):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
     tmp = tempfile.mktemp(suffix=".mp4")
     try:
         data = await video.read()
