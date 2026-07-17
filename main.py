@@ -4,7 +4,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI(title="ForceTrack Bar Path API", version="7.3.8")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+ALLOWED_ORIGINS = [
+    "https://forgedfitnesspt.netlify.app",
+    "http://localhost:3000",   # vite dev
+    "http://localhost:8888",   # netlify dev
+]
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 
 PLATE_DIAMETER_M = 0.450
 TARGET_RES       = 1920
@@ -213,7 +218,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
 
             results=[]
             cap.set(cv2.CAP_PROP_POS_FRAMES,0); fn=0; last_t=0.0
-            vx,vy=0.0,0.0; vel_hist=[]; bad_streak=0
+            vx,vy=0.0,0.0; vel_hist=[]
             # Adaptive radius: slow EMA of detected radii so the Hough search band
             # tracks perspective growth (plate appears larger as bar moves closer).
             # Clamped to [0.85, 1.15]×plate_r — tight enough to prevent positive feedback
@@ -226,7 +231,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                 frame=rotate_frame(frame,rot)
                 msec_t=cap.get(cv2.CAP_PROP_POS_MSEC)/1000.0
                 t=msec_t if msec_t>last_t else fn/fps
-                if fn<3: print(f"[ts-check] frame {fn}: t={t:.4f}s  fps={fps:.1f}",flush=True)
+                if fn==0: print(f"[ts-check] frame 0: t={t:.4f}s  fps={fps:.1f}",flush=True)
 
                 # Velocity-predicted position for this frame. Clamped with a small fixed
                 # margin (not plate_r) so the search centre stays in-frame without
@@ -294,13 +299,12 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
                     if len(vel_hist)>3: vel_hist.pop(0)
                     vx=sum(v[0] for v in vel_hist)/len(vel_hist)
                     vy=sum(v[1] for v in vel_hist)/len(vel_hist)
-                    cx,cy=new_cx,new_cy; bad_streak=0
+                    cx,cy=new_cx,new_cy
                 else:
                     # Fallback: CamShift anchored to predicted position.
                     # Use the same search region as Hough would have so it can reach a
                     # fast-moving plate that Hough missed. Velocity is NOT updated from
                     # CamShift to prevent drift compounding.
-                    bad_streak+=1
                     cs_pad=int(search_pad)
                     tw_x=max(0,int(pred_cx-cs_pad)); tw_y=max(0,int(pred_cy-cs_pad))
                     tw_w=min(wp-tw_x,cs_pad*2);      tw_h=min(hp-tw_y,cs_pad*2)
