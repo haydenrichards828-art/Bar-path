@@ -109,10 +109,8 @@ def camshift_step(bgr_frame, hist, track_window):
 
 def detect_reps(frames,min_frames=8,min_rom=0.03):
     if len(frames)<min_frames*2: return []
-    xs=[f['x'] for f in frames]; ys=[f['y'] for f in frames]; ts=[f['t'] for f in frames]
-    range_x=max(xs)-min(xs); range_y=max(ys)-min(ys)
-    coords=xs if range_x>range_y else ys
-    vel=[(coords[i]-coords[i-1])/max(ts[i]-ts[i-1],0.001) for i in range(1,len(coords))]
+    ys=[f['y'] for f in frames]; ts=[f['t'] for f in frames]
+    vel=[(ys[i]-ys[i-1])/max(ts[i]-ts[i-1],0.001) for i in range(1,len(ys))]
     vel=[vel[0]]+vel
     # Replicate-pad (not zero-pad) so boundary frames don't get artificially pulled
     # toward zero velocity — zero-pad creates phantom direction changes at sequence
@@ -137,7 +135,7 @@ def detect_reps(frames,min_frames=8,min_rom=0.03):
     # direction change but has <3% of frame-height ROM. Real reps are 25-40% of
     # frame height; noise tops out at ~2%. The 10× margin makes this threshold robust.
     return [r for r in merged
-            if (max(coords[r['start']:r['end']+1])-min(coords[r['start']:r['end']+1]))>=min_rom]
+            if (max(ys[r['start']:r['end']+1])-min(ys[r['start']:r['end']+1]))>=min_rom]
 
 @app.get("/health")
 def health(): return {"status":"ok","version":app.version}
