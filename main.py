@@ -15,12 +15,29 @@ PLATE_DIAMETER_M = 0.450
 TARGET_RES       = 1920
 
 def get_rotation(path):
+    def norm(v): return int(v) % 360   # -90->270, -180->180, -270->90
     try:
         r = subprocess.run(["ffprobe","-v","error","-select_streams","v:0","-show_entries",
             "stream_tags=rotate","-of","default=noprint_wrappers=1:nokey=1",path],
             capture_output=True, text=True, timeout=10)
-        v = r.stdout.strip(); return int(v) if v else 0
-    except: return 0
+        v = r.stdout.strip()
+        if v: return norm(v)
+    except: pass
+    # Fallback: some iPhone export paths and screen-recording apps only populate
+    # the Display Matrix side_data rotation, not the classic tags:rotate field —
+    # check that too when the primary read comes back empty.
+    try:
+        r2 = subprocess.run(["ffprobe","-v","error","-select_streams","v:0",
+            "-show_streams","-of","json",path],
+            capture_output=True, text=True, timeout=10)
+        data = json.loads(r2.stdout or "{}")
+        for stream in data.get("streams", []):
+            for sd in stream.get("side_data_list", []) or []:
+                rot = sd.get("rotation")
+                if rot is not None and float(rot) != 0:
+                    return norm(int(float(rot)))
+    except: pass
+    return 0
 
 def normalise_video(path):
     try:
