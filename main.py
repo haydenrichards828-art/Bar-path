@@ -22,7 +22,8 @@ def get_rotation(path):
             capture_output=True, text=True, timeout=10)
         v = r.stdout.strip()
         if v: return norm(v)
-    except: pass
+    except Exception as e:
+        print(f"[get_rotation] primary rotate-tag probe failed: {e}", flush=True)
     # Fallback: some iPhone export paths and screen-recording apps only populate
     # the Display Matrix side_data rotation, not the classic tags:rotate field —
     # check that too when the primary read comes back empty.
@@ -36,7 +37,8 @@ def get_rotation(path):
                 rot = sd.get("rotation")
                 if rot is not None and float(rot) != 0:
                     return norm(int(float(rot)))
-    except: pass
+    except Exception as e:
+        print(f"[get_rotation] side_data rotation fallback failed: {e}", flush=True)
     return 0
 
 def normalise_video(path):
@@ -55,7 +57,8 @@ def normalise_video(path):
             "-c:v","libx264","-crf","20","-preset","fast","-an","-y",out],
             capture_output=True, timeout=180)
         if r2.returncode==0: os.unlink(path); return out
-    except: pass
+    except Exception as e:
+        print(f"[normalise_video] failed, using original file as-is: {e}", flush=True)
     return path
 
 def rotate_frame(frame, rot):
@@ -193,7 +196,9 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
             _ds=min(1.0,540.0/min(wp,hp))
             g0=cv2.cvtColor(f0,cv2.COLOR_BGR2GRAY)
             try: p=json.loads(params)
-            except: p={}
+            except Exception as e:
+                print(f"[analyze] failed to parse params, using defaults: {e}", flush=True)
+                p={}
             tx=float(p.get("start_x",0.5))*wp; ty=float(p.get("start_y",0.5))*hp
             # Radius range tuned to a single bumper plate: 5–30% of the shorter frame side
             short_side=min(wp,hp)
@@ -364,6 +369,7 @@ async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: 
         finally:
             for f in set([tmp,work]):
                 try: os.unlink(f)
-                except: pass
+                except Exception as e:
+                    print(f"[analyze] cleanup failed for {f}: {e}", flush=True)
 
     return StreamingResponse(stream(),media_type="application/x-ndjson")
