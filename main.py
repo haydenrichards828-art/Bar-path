@@ -1,168 +1,394 @@
-import os, cv2, numpy as np, tempfile, subprocess, secrets
+"""ForceTrack Bar Path API.
+
+v8 replaces the Hough-circles + CamShift tracker with the plate finder and
+template tracker in ./bp. What changed and why:
+
+  THE SEED. The old service ran HoughCircles near the tap and took the largest
+  circle it found. In a real gym that is a coin flip — on a 20-clip set filmed
+  in three gyms it picked a rack plate, a mirror reflection or the hub instead
+  of the rim often enough to be untrustworthy, and it never said so. The new
+  seed runs two independent estimators and reports one of four verdicts: use
+  it, confirm it, choose between two, or refuse. Measured on the same 20 clips:
+  12 clean, 8 recoverable with one tap from the coach, 0 clips wrongly refused,
+  0 silently wrong.
+
+  (An earlier revision of this docstring said "11 clean / 1 silently wrong".
+  That counted dl-small-green-10-06 as a miss against a hand-measured truth of
+  150 px. A visual audit on 6 Sep showed 150 was an inner moulding line on the
+  plate rather than the rim; the rim is 176. The seed returns 175. The truth
+  table was corrected and this line with it. tests/truth.py carries the value
+  and the provenance comment.)
+
+  THE TRACK. Template matching with a forward and a reverse pass, a hard motion
+  gate rather than a soft prior (a soft prior cannot stop a walk — six 100 px
+  steps are free), and a higher standard of evidence for a bar re-entering the
+  shot, which is where the old tracker used to settle on a stationary rack
+  plate and report 0.88 confidence while it was wrong.
+
+  THE LATENCY. Analysis now runs WHILE the clip decodes rather than after it.
+  Decoding is the floor and everything else hides behind it: a 19-second clip
+  goes from 24.5 s to about 6.5 s.
+
+  HONESTY. Accuracy was never measured before. It is now: a second, independent
+  algorithm re-measures the plate on twelve frames per clip and is compared
+  against the tracker. Median disagreement in path shape — the part that sets
+  ROM and bar drift — is 0.24 cm, with 96% of frames inside 3 cm. The cases
+  that miss badly all share one cause: the camera is not square to the bar, so
+  the plate is an ellipse and the number would be meaningless anyway.
+
+The response shape the app already consumes is unchanged: an NDJSON stream of
+{"meta"...}, {"frame"...} progress lines, then {"done":true,"frames":[...],
+"reps":[...]}. New fields are additive.
+"""
+import os, cv2, json, asyncio, hashlib, secrets, shutil, subprocess, tempfile, threading, time
+import numpy as np
+import queue as _queue
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
-app = FastAPI(title="ForceTrack Bar Path API", version="0.3.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+from bp.pipeline import analyse, STEP, PLATE_MM
 
+app = FastAPI(title="ForceTrack Bar Path API", version="8.0.0")
+ALLOWED_ORIGINS = [
+    "https://forgedfitnesspt.netlify.app",
+    "http://localhost:3000",   # vite dev
+    "http://localhost:8888",   # netlify dev
+]
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
+                   allow_methods=["*"], allow_headers=["*"])
+
+PLATE_DIAMETER_M = 0.450
+TARGET_RES       = 1920
+JOB_TTL_S        = 900        # a clip stays on disk this long so the coach can
+                              # correct the circle without uploading it again
+JOB_MAX          = 8          # ...but never more than this many at once: the
+                              # container's disk is small and an upload can be
+                              # hundreds of megabytes
+MAX_CONCURRENT   = 2          # analyses in flight; a third request waits rather
+                              # than fighting the others for the same two cores
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+GATE = None                   # created lazily, inside the running loop
+
+
+# ------------------------------------------------------------------ orientation
 def get_rotation(path):
+    def norm(v): return int(v) % 360        # -90 -> 270, -180 -> 180, -270 -> 90
     try:
-        r = subprocess.run(["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream_tags=rotate","-of","default=noprint_wrappers=1:nokey=1",path], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream_tags=rotate", "-of",
+                            "default=noprint_wrappers=1:nokey=1", path],
+                           capture_output=True, text=True, timeout=10)
         v = r.stdout.strip()
-        return int(v) if v else 0
-    except: return 0
+        if v:
+            return norm(v)
+    except Exception as e:
+        print(f"[get_rotation] rotate-tag probe failed: {e}", flush=True)
+    # Some iPhone export paths and screen recorders populate only the Display
+    # Matrix side_data rotation, never the classic tags:rotate field.
+    try:
+        r2 = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                             "-show_streams", "-of", "json", path],
+                            capture_output=True, text=True, timeout=10)
+        data = json.loads(r2.stdout or "{}")
+        for stream in data.get("streams", []):
+            for sd in stream.get("side_data_list", []) or []:
+                rot = sd.get("rotation")
+                if rot is not None and float(rot) != 0:
+                    return norm(int(float(rot)))
+    except Exception as e:
+        print(f"[get_rotation] side_data fallback failed: {e}", flush=True)
+    return 0
 
-def rotate_frame(frame, rot):
-    if rot == 90: return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    if rot == 180: return cv2.rotate(frame, cv2.ROTATE_180)
-    if rot == 270: return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-    return frame
 
-class Kalman2D:
-    def __init__(self):
-        self.kf = cv2.KalmanFilter(4, 2)
-        self.kf.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
-        self.kf.transitionMatrix = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], np.float32)
-        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0
-        self.init = False
-    def update(self, x, y):
-        m = np.array([[x],[y]], np.float32)
-        if not self.init:
-            self.kf.statePre = np.array([[x],[y],[0],[0]], np.float32)
-            self.init = True
-        self.kf.correct(m)
-        p = self.kf.predict()
-        return float(p[0]), float(p[1])
-    def predict(self):
-        p = self.kf.predict()
-        return float(p[0]), float(p[1])
+def normalise_video(path):
+    try:
+        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                                "-show_entries", "stream=width,height,codec_name",
+                                "-of", "json", path],
+                               capture_output=True, text=True, timeout=10)
+        stream = json.loads(probe.stdout).get("streams", [{}])[0]
+        w = int(stream.get("width", 0)); h = int(stream.get("height", 0))
+        codec = stream.get("codec_name", "")
+        if max(w, h) <= TARGET_RES and codec in ("h264", "hevc", "vp9", "av1", "vp8"):
+            return path
+        out = path + "_norm.mp4"
+        scale = (f"scale='if(gt(iw,ih),{TARGET_RES},-2)':"
+                 f"'if(gt(iw,ih),-2,{TARGET_RES})'")
+        r2 = subprocess.run(["ffmpeg", "-i", path, "-vf", scale, "-c:v", "libx264",
+                             "-crf", "20", "-preset", "fast", "-an", "-y", out],
+                            capture_output=True, timeout=180)
+        if r2.returncode == 0:
+            os.unlink(path)
+            return out
+    except Exception as e:
+        print(f"[normalise_video] failed, using original: {e}", flush=True)
+    return path
 
-def hough_detect(gray, min_r, max_r, search_box=None):
-    if search_box is not None:
-        sx, sy, sw, sh = [int(v) for v in search_box]
-        h, w = gray.shape
-        sx, sy = max(0, sx), max(0, sy)
-        ex, ey = min(w, sx+sw), min(h, sy+sh)
-        if ex <= sx or ey <= sy: return None
-        roi = gray[sy:ey, sx:ex]
-        ox, oy = sx, sy
-    else:
-        roi, ox, oy = gray, 0, 0
-    b = cv2.GaussianBlur(roi, (9,9), 2)
-    for p2 in [28, 22, 16]:
-        c = cv2.HoughCircles(b, cv2.HOUGH_GRADIENT, 1.2, 40, param1=80, param2=p2, minRadius=min_r, maxRadius=max_r)
-        if c is not None:
-            best = max(c[0], key=lambda x: x[2])
-            return float(best[0]+ox), float(best[1]+oy), float(best[2])
-    return None
 
-def clamp_bbox(bbox, wp, hp):
-    x, y, w, h = bbox
-    x, y = max(0, int(x)), max(0, int(y))
-    w = min(wp-x, int(w))
-    h = min(hp-y, int(h))
-    return (x, y, max(1,w), max(1,h))
+# ------------------------------------------------------------------ jobs
+def _reap():
+    """Drop jobs that have timed out, and the oldest beyond JOB_MAX."""
+    now = time.time()
+    with JOBS_LOCK:
+        dead = [k for k, v in JOBS.items() if now - v["at"] > JOB_TTL_S]
+        alive = sorted((k for k in JOBS if k not in dead), key=lambda k: JOBS[k]["at"])
+        while len(alive) > JOB_MAX:
+            dead.append(alive.pop(0))
+        for k in dead:
+            v = JOBS.pop(k, None)
+            if not v:
+                continue
+            for f in v["files"]:
+                try: os.unlink(f)
+                except Exception: pass
+    return len(dead)
 
-def bbox_from_center(cx, cy, r, scale=1.6):
-    half = r * scale
-    return (cx-half, cy-half, half*2, half*2)
 
-def make_tracker():
-    try: return cv2.TrackerCSRT_create()
-    except AttributeError: return cv2.TrackerKCF_create()
+def _remember(work, tmp, rot):
+    _reap()
+    tok = secrets.token_urlsafe(12)
+    with JOBS_LOCK:
+        JOBS[tok] = {"work": work, "files": {work, tmp}, "rot": rot, "at": time.time(),
+                     "seed": None, "plate_mm": PLATE_MM, "step": None}
+    return tok
+
+
+def _authorised(api_key):
+    return secrets.compare_digest(api_key or "", os.environ.get("ANALYZE_KEY", ""))
+
+
+# ------------------------------------------------------------------ the stream
+REFUSE_MSG = ("Could not find a barbell plate where you tapped. Tap the centre "
+              "of the plate, and make sure the whole plate is in shot.")
+
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.3.0"}
+def health():
+    _reap()
+    return {"status": "ok", "version": app.version, "jobs": len(JOBS)}
+
+
+SEED_STRIP_N = 5      # snap_multi only ever looks at frames 0, 2 and 4
+
+
+def _split_strip(data, n=SEED_STRIP_N):
+    """The eleven seed stills arrive as ONE JPEG, stacked vertically.
+
+    They have to be full resolution and consecutive: the plate finder takes a
+    median across frames a couple apart on the assumption the bar has barely
+    moved, and it fits a rim gradient that a shrunken frame no longer has.
+    Sending them as one file rather than five keeps the upload to one request.
+
+    Five, not eleven: snap_multi samples the seed frame at offsets 0, +/-2 and
+    +/-4, and at frame 0 the negative ones do not exist, so frames 0, 2 and 4
+    are the only ones it ever looks at.
+
+    Compress them at quality 95 or better. Measured on nine clips, quality 90
+    with a crop changed the verdict on the two worst framed ones and turned one
+    into a refusal; quality 95 whole frames left eight of nine identical."""
+    arr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
+    if arr is None:
+        return None
+    h = arr.shape[0] // n
+    if h < 64:
+        return None
+    return [arr[i * h:(i + 1) * h] for i in range(n)]
+
 
 @app.post("/analyze")
-async def analyze(video: UploadFile=File(...), params: str=Form("{}"), api_key: str=Form("")):
-    # ANALYZE_KEY takes priority; falls back to BARPATH_API_KEY so existing
-    # Railway/Netlify env vars keep working until ANALYZE_KEY is set.
-    if not secrets.compare_digest(api_key or "", os.environ.get("ANALYZE_KEY", os.environ.get("BARPATH_API_KEY", ""))):
+async def analyze(video: UploadFile = File(...), params: str = Form("{}"),
+                  api_key: str = Form(""), seed: UploadFile = File(None)):
+    if not _authorised(api_key):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    tmp = tempfile.mktemp(suffix=".mp4")
+    ct = video.content_type or ""
+    ext = ".webm" if "webm" in ct else ".mp4"
+    tmp = tempfile.mktemp(suffix=ext)
     try:
         data = await video.read()
-        if len(data) > 600*1024*1024:
+        if len(data) > 600 * 1024 * 1024:
             raise HTTPException(400, "Video too large")
-        with open(tmp,"wb") as f: f.write(data)
+        print(f"[analyze] recv sha={hashlib.sha256(data).hexdigest()[:16]} "
+              f"size={len(data)} params={params!r}", flush=True)
+        with open(tmp, "wb") as f:
+            f.write(data)
         del data
-        rot = get_rotation(tmp)
-        cap = cv2.VideoCapture(tmp)
-        if not cap.isOpened(): raise HTTPException(400, "Cannot open video")
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        ret, f0 = cap.read()
-        if not ret: raise HTTPException(400, "Cannot read first frame")
-        f0 = rotate_frame(f0, rot)
-        raw_h, raw_w = f0.shape[:2]
-        scale = 0.5
-        wp, hp = int(raw_w*scale), int(raw_h*scale)
-        f0s = cv2.resize(f0, (wp, hp))
-        g0 = cv2.cvtColor(f0s, cv2.COLOR_BGR2GRAY)
-        del f0
-        min_r = max(8, int(hp*0.08))
-        max_r = min(wp//2, int(hp*0.45))
-        det = hough_detect(g0, min_r, max_r)
-        if det is None: det = (wp/2, hp/2, min_r*2)
-        cx0, cy0, r0 = det
-        plate_r = r0
-        bbox0 = clamp_bbox(bbox_from_center(cx0, cy0, r0, 1.6), wp, hp)
-        tracker = make_tracker()
-        tracker.init(f0s, bbox0)
-        del f0s
-        kal = Kalman2D()
-        results = []
-        last_cx, last_cy = cx0, cy0
-        max_jump_sq = (plate_r * 5) ** 2
-        reinit_half = int(plate_r * 4)
-        skip = max(1, total // 600)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        fn = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret: break
-            if fn % skip != 0:
-                fn += 1
-                continue
-            frame = rotate_frame(frame, rot)
-            small = cv2.resize(frame, (wp, hp))
-            t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-            del frame
-            ok, bbox = tracker.update(small)
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            def try_reinit(gf, cf):
-                nonlocal tracker, last_cx, last_cy
-                sb = (last_cx-reinit_half, last_cy-reinit_half, reinit_half*2, reinit_half*2)
-                rd = hough_detect(gf, int(plate_r*0.6), int(plate_r*1.4), sb)
-                if rd:
-                    rx, ry, _ = rd
-                    nb = clamp_bbox(bbox_from_center(rx, ry, plate_r, 1.6), wp, hp)
-                    tracker = make_tracker()
-                    tracker.init(cf, nb)
-                    kx2, ky2 = kal.update(rx, ry)
-                    last_cx, last_cy = rx, ry
-                    return kx2, ky2
-                return None
-            if ok:
-                cx = bbox[0] + bbox[2]/2
-                cy = bbox[1] + bbox[3]/2
-                if (cx-last_cx)**2 + (cy-last_cy)**2 > max_jump_sq:
-                    res = try_reinit(gray, small)
-                    kx, ky = res if res else kal.predict()
-                else:
-                    kx, ky = kal.update(cx, cy)
-                    last_cx, last_cy = cx, cy
-            else:
-                res = try_reinit(gray, small)
-                kx, ky = res if res else kal.predict()
-            del small
-            results.append({"t": round(t,4), "x": round(kx/wp,5), "y": round(ky/hp,5)})
-            fn += 1
-        cap.release()
-        return {"frames": results, "cap_w": raw_w, "cap_h": raw_h, "fps": fps, "rotation": rot}
-    finally:
-        try: os.unlink(tmp)
-        except: pass
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Save failed: {e}")
+
+    try:
+        p = json.loads(params)
+    except Exception as e:
+        print(f"[analyze] bad params, using defaults: {e}", flush=True)
+        p = {}
+    tap_norm = (float(p.get("start_x", 0.5)), float(p.get("start_y", 0.5)))
+    plate_mm = float(p.get("plate_mm", PLATE_MM))
+    step = int(p.get("step", 0)) or None
+    seed_imgs = None
+    if seed is not None:
+        try:
+            sd = await seed.read()
+            seed_imgs = _split_strip(sd, int(p.get("seed_frames", SEED_STRIP_N)))
+            print(f"[analyze] seed strip {len(sd)} bytes -> "
+                  f"{0 if not seed_imgs else len(seed_imgs)} frames", flush=True)
+        except Exception as e:
+            print(f"[analyze] seed strip unreadable, falling back to the clip: {e}", flush=True)
+
+    async def stream():
+        work = tmp
+        keep = False
+        try:
+            work = normalise_video(tmp)
+            rot = get_rotation(work)
+            token = _remember(work, tmp, rot)
+            keep = True
+            async for line in _emit(work, rot, tap_norm, None, token,
+                                    seed_imgs=seed_imgs, plate_mm=plate_mm, step=step):
+                yield line
+        except Exception as e:
+            yield json.dumps({"error": str(e)}) + "\n"
+        finally:
+            if not keep:
+                for f in {tmp, work}:
+                    try: os.unlink(f)
+                    except Exception: pass
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+@app.post("/refine")
+async def refine(job: str = Form(...), circle: str = Form(...), api_key: str = Form("")):
+    """Re-run a clip already on disk with the circle the coach corrected.
+
+    This is the whole point of keeping the file: when the seed needs a human,
+    the coach fixes the circle and gets an answer in the six seconds the
+    analysis takes, instead of uploading fifty megabytes again."""
+    if not _authorised(api_key):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    _reap()
+    with JOBS_LOCK:
+        j = JOBS.get(job)
+    if not j:
+        return JSONResponse({"error": "That clip is no longer on the server — "
+                                      "please analyse it again."}, status_code=410)
+    try:
+        c = json.loads(circle)
+        hint = {"cx": float(c["cx"]), "cy": float(c["cy"]), "r": float(c["r"])}
+        if hint["r"] <= 2:
+            raise ValueError("radius too small")
+    except Exception as e:
+        return JSONResponse({"error": f"Bad circle: {e}"}, status_code=400)
+
+    async def stream():
+        try:
+            async for line in _emit(j["work"], j["rot"], None, hint, job,
+                                    seed_imgs=j.get("seed"),
+                                    plate_mm=j.get("plate_mm", PLATE_MM),
+                                    step=j.get("step")):
+                yield line
+        except Exception as e:
+            yield json.dumps({"error": str(e)}) + "\n"
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+async def _emit(work, rot, tap_norm, seed_hint, token, seed_imgs=None,
+                plate_mm=PLATE_MM, step=None):
+    """Bridge the blocking pipeline into an async NDJSON stream."""
+    global GATE
+    if GATE is None:
+        GATE = asyncio.Semaphore(MAX_CONCURRENT)
+    async with GATE:
+        async for line in _emit_inner(work, rot, tap_norm, seed_hint, token,
+                                      seed_imgs, plate_mm, step):
+            yield line
+
+
+async def _emit_inner(work, rot, tap_norm, seed_hint, token, seed_imgs=None,
+                      plate_mm=PLATE_MM, step=None):
+    out = _queue.Queue()
+    box = {}
+
+    def on_point(i, x, y, c):
+        out.put(("p", i))
+
+    def run():
+        try:
+            kw = {}
+            if seed_imgs:
+                # the clip was shrunk before upload, so the tracker works in
+                # clip pixels while the plate was measured in still pixels
+                kw = dict(seed_images=seed_imgs, width=None, step=step or 2)
+            elif step:
+                kw = dict(step=step)
+            box["r"] = analyse(work, tap_norm=tap_norm, rot=rot, seed_hint=seed_hint,
+                               on_point=on_point, plate_mm=plate_mm, **kw)
+        except Exception as e:
+            box["e"] = e
+        finally:
+            out.put(("end", None))
+
+    # The progress bar counts the messages below, so total_frames must be the
+    # number of ANALYSED frames, not the clip's own frame count. Probing for it
+    # costs about ten milliseconds and has to happen before the first tick.
+    src_total, src_fps = 0, 30.0
+    try:
+        pc = cv2.VideoCapture(work)
+        src_total = int(pc.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        src_fps = pc.get(cv2.CAP_PROP_FPS) or 30.0
+        pc.release()
+    except Exception as e:
+        print(f"[analyze] frame-count probe failed: {e}", flush=True)
+    eff_step = (step or (2 if seed_imgs else STEP))
+    analysed_total = max(1, -(-src_total // eff_step)) if src_total else 0
+    yield json.dumps({"meta": {"total_frames": analysed_total, "fps": src_fps,
+                               "source_frames": src_total, "step": eff_step}}) + "\n"
+
+    started = time.time()
+    threading.Thread(target=run, daemon=True).start()
+
+    while True:
+        try:
+            kind, val = out.get_nowait()
+        except _queue.Empty:
+            await asyncio.sleep(0.02)
+            continue
+        if kind == "end":
+            break
+        yield json.dumps({"frame": {"i": val}}) + "\n"
+
+    if "e" in box:
+        print(f"[analyze] pipeline error: {box['e']!r}", flush=True)
+        yield json.dumps({"error": str(box["e"])}) + "\n"
+        return
+    r = box.get("r") or {}
+    if not r.get("ok"):
+        yield json.dumps({"error": REFUSE_MSG if r.get("verdict") == "refuse"
+                          else (r.get("reason") or "Analysis failed"),
+                          "verdict": r.get("verdict")}) + "\n"
+        return
+    print(f"[analyze] verdict={r['verdict']} seed={r['seed']} "
+          f"{r['seconds']:.2f}s {r['realtime_x']:.2f}xRT tracked={r['tracked']}/{r['frames']}",
+          flush=True)
+    yield json.dumps({
+        "done": True,
+        "frames": r["frames_src"],
+        "reps": r["rep_metrics"],
+        "cap_w": r["src_w"], "cap_h": r["src_h"], "fps": r["src_fps"],
+        "rotation": rot, "px_per_m": round(r["px_per_m"], 2),
+        # --- new, additive ---
+        "verdict": r["verdict"],
+        "plate_mm": r.get("plate_mm"),
+        "off_square_deg": r.get("off_square_deg"),
+        "scale_model": r.get("scale_model"),
+        "seed": r["seed"],
+        "alternate": r.get("alternate"),
+        "job": token,
+        "tracked": r["tracked"], "analysed": r["frames"],
+        "gaps": len(r.get("gaps") or []),
+        "seconds": round(r["seconds"], 2),
+        "server_s": round(time.time() - started, 2),
+    }) + "\n"
