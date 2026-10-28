@@ -411,14 +411,38 @@ async def _emit(work, rot, tap_norm, seed_hint, token, seed_imgs=None,
     global GATE
     if GATE is None:
         GATE = asyncio.Semaphore(MAX_CONCURRENT)
-    async with GATE:
+    await GATE.acquire()
+    held = {}
+    try:
         async for line in _emit_inner(work, rot, tap_norm, seed_hint, token,
-                                      seed_imgs, plate_mm, step):
+                                      seed_imgs, plate_mm, step, held):
             yield line
+    finally:
+        # The pipeline cannot be interrupted. If the stream ends while it is
+        # still running — the time limit, or the coach closing the editor —
+        # its slot stays taken until the thread really finishes, so abandoned
+        # analyses cannot pile up past MAX_CONCURRENT.
+        w = held.get("worker")
+        if w is not None and w.is_alive():
+            t = asyncio.get_running_loop().create_task(_release_when_done(w))
+            _PENDING.add(t)
+            t.add_done_callback(_PENDING.discard)
+        else:
+            GATE.release()
+
+
+_PENDING = set()
+
+
+async def _release_when_done(worker):
+    try:
+        await asyncio.to_thread(worker.join)
+    finally:
+        GATE.release()
 
 
 async def _emit_inner(work, rot, tap_norm, seed_hint, token, seed_imgs=None,
-                      plate_mm=PLATE_MM, step=None):
+                      plate_mm=PLATE_MM, step=None, held=None):
     out = _queue.Queue()
     box = {}
 
@@ -460,19 +484,19 @@ async def _emit_inner(work, rot, tap_norm, seed_hint, token, seed_imgs=None,
     started = time.time()
     worker = threading.Thread(target=run, daemon=True)
     worker.start()
+    if held is not None:
+        held["worker"] = worker
 
     while True:
         try:
             kind, val = out.get_nowait()
         except _queue.Empty:
             if time.time() - started > MAX_REQUEST_S:
-                # The pipeline cannot be interrupted mid-frame, so the coach
-                # gets an answer now and the worker keeps the concurrency slot
-                # (we are still inside GATE) for up to 30 s more to finish.
+                # The coach gets an answer now; the worker keeps its slot
+                # until it ends (see _emit).
                 print(f"[analyze] over {MAX_REQUEST_S}s, giving up", flush=True)
                 yield json.dumps({"error": "The analysis took too long. Trim the "
                                            "video to the lift itself and try again."}) + "\n"
-                await asyncio.to_thread(worker.join, 30)
                 return
             await asyncio.sleep(0.02)
             continue
