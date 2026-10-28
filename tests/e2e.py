@@ -16,7 +16,7 @@ def post(video, params, seed=None):
         parts.append(b'Content-Disposition: form-data; name="seed"; filename="s.jpg"\r\n'
                      b'Content-Type: image/jpeg\r\n\r\n'+open(seed,"rb").read())
     body=b"".join(b"--X\r\n"+p+b"\r\n" for p in parts)+b"--X--\r\n"
-    req=urllib.request.Request(URL,data=body,headers={"Content-Type":"multipart/form-data; boundary=X"})
+    req=urllib.request.Request(URL,data=body,headers={"Content-Type":"multipart/form-data; boundary=X","x-barpath-key":os.environ.get("K","")})
     t0=time.time()
     with urllib.request.urlopen(req,timeout=300) as r: raw=r.read().decode()
     return time.time()-t0, len(body), [json.loads(l) for l in raw.splitlines() if l.strip()]

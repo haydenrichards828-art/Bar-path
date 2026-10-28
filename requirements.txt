@@ -1,6 +1,12 @@
-# ForceTrack Bar Path API
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
+# Web stack: current releases (28 Oct 2026). Same bar path, byte for byte, on a
+# real clip before and after (tests/same_path.py).
+fastapi==0.162.0
+starlette==1.10.0
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
+# PINNED, deliberately. opencv 4.14.0.94 + numpy 2.4.6 moved the bar path on the
+# same clip: off_square_deg 17.8 -> 23.4, drift 0.119 -> 0.118 m, px_per_m
+# 219.32 -> 218.98. Since T-9327 nothing reaches the decoder without the key, so
+# these move only together with a run of tests/regress.py on the 20-clip set.
 opencv-contrib-python-headless==4.9.0.80
 numpy==1.26.3
-python-multipart==0.0.9

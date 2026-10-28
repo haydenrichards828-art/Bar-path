@@ -13,4 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY bp/ ./bp/
 EXPOSE 8000
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+# --limit-concurrency: past this many open connections uvicorn answers 503
+# instead of queueing without bound. --no-server-header: no version banner.
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} \
+    --limit-concurrency 16 --timeout-keep-alive 5 --no-server-header

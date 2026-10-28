@@ -44,19 +44,16 @@ import os, cv2, json, asyncio, hashlib, secrets, shutil, subprocess, tempfile, t
 import numpy as np
 import queue as _queue
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from bp.pipeline import analyse, STEP, PLATE_MM
 
-app = FastAPI(title="ForceTrack Bar Path API", version="8.0.0")
-ALLOWED_ORIGINS = [
-    "https://forgedfitnesspt.netlify.app",
-    "http://localhost:3000",   # vite dev
-    "http://localhost:8888",   # netlify dev
-]
-app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
-                   allow_methods=["*"], allow_headers=["*"])
+# No /docs, /redoc or /openapi.json: the only caller is the app's own proxy, and
+# a public schema is a map for everyone else. No CORS either, for the same
+# reason — since T-9056 no browser calls this service directly, so a browser
+# that tries is refused by its own same-origin rule as well as by the key.
+app = FastAPI(title="ForceTrack Bar Path API", version="8.1.0",
+              docs_url=None, redoc_url=None, openapi_url=None)
 
 PLATE_DIAMETER_M = 0.450
 TARGET_RES       = 1920
@@ -155,8 +152,118 @@ def _remember(work, tmp, rot):
     return tok
 
 
-def _authorised(api_key):
-    return secrets.compare_digest(api_key or "", os.environ.get("ANALYZE_KEY", ""))
+# ------------------------------------------------------------------ the gate
+# Everything below runs BEFORE FastAPI reads a byte of the upload, so a caller
+# without the key costs the service one header comparison, not a 600 MB read.
+#
+# Until 8.1.0 the key was the `api_key` form field, compared against
+# ANALYZE_KEY with a default of "". With ANALYZE_KEY unset, "" == "" and every
+# caller was let in: measured on 28 Oct, a direct POST to /analyze with no key
+# at all was analysed. Now:
+#   - the key is a HEADER, x-barpath-key, checked before the body is read;
+#   - an unset or short ANALYZE_KEY refuses everything (503) instead of
+#     accepting everything. The old key was public in the app's JavaScript
+#     until T-9056 and was short; the length rule is what makes "accept the new
+#     key only" true without the old value appearing anywhere.
+KEY_ENV       = "ANALYZE_KEY"
+KEY_MIN_LEN   = 32
+MAX_BODY      = 10 * 1024 * 1024   # the proxy refuses over 6 MB; this is the
+                                   # service's own ceiling, with room for the
+                                   # multipart framing the proxy adds back
+MAX_REQUEST_S = 150                # the editor gives up at 180 s
+RATE_WINDOW_S = 600
+RATE_MAX      = 30                 # per coach per 10 min, /analyze and /refine
+                                   # together. An analysis and a few corrections
+                                   # is under ten; thirty is already a loop.
+GUARDED       = {"/analyze", "/refine"}
+_RATE = {}
+_RATE_LOCK = threading.Lock()
+
+
+def _key():
+    k = os.environ.get(KEY_ENV, "")
+    return k if len(k) >= KEY_MIN_LEN else None
+
+
+def _over_rate(coach, now=None):
+    """Seconds to wait, or 0. This process is the only replica, so unlike the
+    proxy's per-instance brake this count is the real one across every
+    Netlify instance."""
+    now = now or time.time()
+    with _RATE_LOCK:
+        if len(_RATE) > 5000:
+            for k in [k for k, v in _RATE.items() if now - v[0] > RATE_WINDOW_S]:
+                del _RATE[k]
+        start, used = _RATE.get(coach, (now, 0))
+        if now - start > RATE_WINDOW_S:
+            start, used = now, 0
+        if used >= RATE_MAX:
+            return max(1, int(start + RATE_WINDOW_S - now))
+        _RATE[coach] = (start, used + 1)
+        return 0
+
+
+async def _reply(send, status, body, extra=()):
+    data = json.dumps(body).encode()
+    await send({"type": "http.response.start", "status": status,
+                "headers": [(b"content-type", b"application/json"),
+                            (b"content-length", str(len(data)).encode()), *extra]})
+    await send({"type": "http.response.body", "body": data})
+
+
+class Gate:
+    """Key, size and rate, in that order, as plain ASGI so it runs first."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["path"] not in GUARDED:
+            return await self.app(scope, receive, send)
+        h = {k.decode("latin-1").lower(): v for k, v in scope["headers"]}
+        key = _key()
+        if key is None:
+            print(f"[gate] {KEY_ENV} unset or shorter than {KEY_MIN_LEN}; refusing", flush=True)
+            return await _reply(send, 503, {"error": "Bar path analysis is not configured on the server."})
+        if not secrets.compare_digest(h.get("x-barpath-key", b""), key.encode()):
+            return await _reply(send, 401, {"error": "unauthorized"})
+        try:
+            declared = int(h.get("content-length", b"0"))
+        except ValueError:
+            return await _reply(send, 400, {"error": "Bad Content-Length"})
+        if declared > MAX_BODY:
+            return await _reply(send, 413, {"error": "Upload too large"})
+        coach = h.get("x-barpath-coach", b"").decode("latin-1")[:64] or "unknown"
+        wait = _over_rate(coach)
+        if wait:
+            return await _reply(send, 429, {"error": "Too many analyses — try again shortly."},
+                                [(b"retry-after", str(wait).encode())])
+        # The body is read here, under the cap, so an upload with no
+        # Content-Length (chunked) meets the same limit as one that declares it.
+        chunks, size = [], 0
+        while True:
+            m = await receive()
+            if m["type"] == "http.disconnect":
+                return
+            size += len(m.get("body", b""))
+            if size > MAX_BODY:
+                return await _reply(send, 413, {"error": "Upload too large"})
+            chunks.append(m.get("body", b""))
+            if not m.get("more_body"):
+                break
+        body, replayed = b"".join(chunks), False
+
+        async def replay():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()       # the disconnect the stream listens for
+
+        await self.app(scope, replay, send)
+
+
+app.add_middleware(Gate)
 
 
 # ------------------------------------------------------------------ the stream
@@ -166,8 +273,15 @@ REFUSE_MSG = ("Could not find a barbell plate where you tapped. Tap the centre "
 
 @app.get("/health")
 def health():
+    """Railway's deploy check (railway.json). 503 only when the image itself is
+    broken, so a bad build never replaces a good one. A missing key is
+    reported, not failed: failing the check would keep the previous, open
+    build serving traffic, which is the exact thing this release closes."""
     _reap()
-    return {"status": "ok", "version": app.version, "jobs": len(JOBS)}
+    tools = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+    body = {"status": "ok" if tools else "degraded", "version": app.version,
+            "jobs": len(JOBS), "auth": "configured" if _key() else "missing"}
+    return JSONResponse(body, status_code=200 if tools else 503)
 
 
 SEED_STRIP_N = 5      # snap_multi only ever looks at frames 0, 2 and 4
@@ -199,9 +313,7 @@ def _split_strip(data, n=SEED_STRIP_N):
 
 @app.post("/analyze")
 async def analyze(video: UploadFile = File(...), params: str = Form("{}"),
-                  api_key: str = Form(""), seed: UploadFile = File(None)):
-    if not _authorised(api_key):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
+                  seed: UploadFile = File(None)):
     ct = video.content_type or ""
     ext = ".webm" if "webm" in ct else ".mp4"
     tmp = tempfile.mktemp(suffix=ext)
@@ -260,14 +372,12 @@ async def analyze(video: UploadFile = File(...), params: str = Form("{}"),
 
 
 @app.post("/refine")
-async def refine(job: str = Form(...), circle: str = Form(...), api_key: str = Form("")):
+async def refine(job: str = Form(...), circle: str = Form(...)):
     """Re-run a clip already on disk with the circle the coach corrected.
 
     This is the whole point of keeping the file: when the seed needs a human,
     the coach fixes the circle and gets an answer in the six seconds the
     analysis takes, instead of uploading fifty megabytes again."""
-    if not _authorised(api_key):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
     _reap()
     with JOBS_LOCK:
         j = JOBS.get(job)
@@ -348,12 +458,22 @@ async def _emit_inner(work, rot, tap_norm, seed_hint, token, seed_imgs=None,
                                "source_frames": src_total, "step": eff_step}}) + "\n"
 
     started = time.time()
-    threading.Thread(target=run, daemon=True).start()
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
 
     while True:
         try:
             kind, val = out.get_nowait()
         except _queue.Empty:
+            if time.time() - started > MAX_REQUEST_S:
+                # The pipeline cannot be interrupted mid-frame, so the coach
+                # gets an answer now and the worker keeps the concurrency slot
+                # (we are still inside GATE) for up to 30 s more to finish.
+                print(f"[analyze] over {MAX_REQUEST_S}s, giving up", flush=True)
+                yield json.dumps({"error": "The analysis took too long. Trim the "
+                                           "video to the lift itself and try again."}) + "\n"
+                await asyncio.to_thread(worker.join, 30)
+                return
             await asyncio.sleep(0.02)
             continue
         if kind == "end":

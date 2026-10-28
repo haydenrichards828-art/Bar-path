@@ -19,7 +19,7 @@ def post(stem):
     with open(path,"rb") as f: vid=f.read()
     parts.append(b'Content-Disposition: form-data; name="video"; filename="c.mp4"\r\nContent-Type: video/mp4\r\n\r\n'+vid)
     body=b"".join(b"--X\r\n"+p+b"\r\n" for p in parts)+b"--X--\r\n"
-    req=urllib.request.Request(URL,data=body,headers={"Content-Type":"multipart/form-data; boundary=X"})
+    req=urllib.request.Request(URL,data=body,headers={"Content-Type":"multipart/form-data; boundary=X","x-barpath-key":os.environ.get("K","")})
     t0=time.time()
     with urllib.request.urlopen(req,timeout=300) as r:
         raw=r.read().decode()
