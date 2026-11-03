@@ -49,7 +49,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from bp.pipeline import analyse, STEP, PLATE_MM
 
-app = FastAPI(title="ForceTrack Bar Path API", version="8.0.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="9.0.0")
 ALLOWED_ORIGINS = [
     "https://forgedfitnesspt.netlify.app",
     "http://localhost:3000",   # vite dev
@@ -74,19 +74,18 @@ GATE = None                   # created lazily, inside the running loop
 
 # ------------------------------------------------------------------ orientation
 def get_rotation(path):
-    def norm(v): return int(v) % 360        # -90 -> 270, -180 -> 180, -270 -> 90
-    try:
-        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
-                            "-show_entries", "stream_tags=rotate", "-of",
-                            "default=noprint_wrappers=1:nokey=1", path],
-                           capture_output=True, text=True, timeout=10)
-        v = r.stdout.strip()
-        if v:
-            return norm(v)
-    except Exception as e:
-        print(f"[get_rotation] rotate-tag probe failed: {e}", flush=True)
-    # Some iPhone export paths and screen recorders populate only the Display
-    # Matrix side_data rotation, never the classic tags:rotate field.
+    """Degrees, in bp.pipeline._rot's terms (90 = turn anticlockwise), that
+    make the stored frame upright.
+
+    Two places carry the answer and they use OPPOSITE signs. The display
+    matrix side data (what ffmpeg 5 and later report, and what iPhones write)
+    says -90 for a portrait clip, meaning turn it 90 clockwise, which is 270
+    here. The legacy `rotate` tag (ffmpeg 4 and older, and some exports) says
+    90 for the same clip, also meaning 90 clockwise, so it must be negated.
+    This used to read the tag first and pass it straight through, which turns
+    a portrait clip upside down wherever the tag exists. Side data first now,
+    and the tag negated."""
+    def norm(v): return int(round(float(v))) % 360   # -90 -> 270, -180 -> 180, -270 -> 90
     try:
         r2 = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
                              "-show_streams", "-of", "json", path],
@@ -96,9 +95,12 @@ def get_rotation(path):
             for sd in stream.get("side_data_list", []) or []:
                 rot = sd.get("rotation")
                 if rot is not None and float(rot) != 0:
-                    return norm(int(float(rot)))
+                    return norm(rot)
+            tag = (stream.get("tags") or {}).get("rotate")
+            if tag not in (None, "", "0"):
+                return norm(-float(tag))
     except Exception as e:
-        print(f"[get_rotation] side_data fallback failed: {e}", flush=True)
+        print(f"[get_rotation] probe failed: {e}", flush=True)
     return 0
 
 
@@ -381,6 +383,11 @@ async def _emit_inner(work, rot, tap_norm, seed_hint, token, seed_imgs=None,
         "rotation": rot, "px_per_m": round(r["px_per_m"], 2),
         # --- new, additive ---
         "verdict": r["verdict"],
+        # v9: why the verdict is "check" when the plate finder said "ok"
+        # (the path left the plate, a rep could not be measured, ...), and
+        # the plate finder's own verdict before the track confirmed or doubted it
+        "doubts": r.get("doubts") or [],
+        "seed_verdict": r.get("seed_verdict"),
         "plate_mm": r.get("plate_mm"),
         "off_square_deg": r.get("off_square_deg"),
         "scale_model": r.get("scale_model"),

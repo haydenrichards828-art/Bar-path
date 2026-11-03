@@ -16,9 +16,9 @@
    0.71,
    0.59
   ],
-  "expect": "refuse",
+  "expect": "ask",
   "reps": null,
-  "why": "filmed from about 45 degrees and far away: no honest number exists"
+  "why": "filmed from about 45 degrees and far away: no honest number exists (was refuse: at 45 degrees round the lifter the plate's height and the bar's vertical travel are both intact, so measuring it is fine if the numbers are right; asking is fine too)"
  },
  "dl-close-stacked-plate-cut-bottom-3054": {
   "lift": "dl",
@@ -246,5 +246,215 @@
   "expect": "ask",
   "reps": 1,
   "why": "spotter's hands around the bar; seed radius came out 300 for a plate of about 180"
+ },
+ "bench-side-green-plate-2919": {
+  "lift": "bench",
+  "tap": [
+   0.14,
+   0.4
+  ],
+  "expect": "ok",
+  "reps": null,
+  "why": "side bench, green plate near the left edge, rack upright in front at rest"
+ },
+ "bench-side-rogue-foreground-2836": {
+  "lift": "bench",
+  "tap": [
+   0.3,
+   0.45
+  ],
+  "expect": "ok",
+  "reps": null,
+  "why": "side bench, Rogue plate, spotter behind, red pad in the foreground"
+ },
+ "bench-side-rogue-rack-arm-2835": {
+  "lift": "bench",
+  "tap": [
+   0.26,
+   0.45
+  ],
+  "expect": "ok",
+  "reps": 12,
+  "why": "side bench, lifter sits down first, rack arm and spotter near the plate; 12 reps (counted from the v9 track with a frame at every bottom and top)"
+ },
+ "dl-oblique-iron-2731": {
+  "lift": "dl",
+  "tap": [
+   0.65,
+   0.625
+  ],
+  "expect": "ask",
+  "reps": null,
+  "why": "deadlift filmed about 30 degrees off side, iron plate"
+ },
+ "dl-side-black-yellow-hub-2861": {
+  "lift": "dl",
+  "tap": [
+   0.42,
+   0.555
+  ],
+  "expect": "ok",
+  "reps": 6,
+  "why": "side deadlift, lifter walks in, yellow hub, decoy plates behind"
+ },
+ "dl-side-blue-rogue-close-2943": {
+  "lift": "dl",
+  "tap": [
+   0.41,
+   0.8
+  ],
+  "expect": "ok",
+  "reps": 2,
+  "why": "close side deadlift, big Rogue plate low in frame"
+ },
+ "dl-side-fitek-mid-2856": {
+  "lift": "dl",
+  "tap": [
+   0.58,
+   0.48
+  ],
+  "expect": "ok",
+  "reps": 4,
+  "why": "side deadlift, Fitek plate, mid distance; 4 reps, the bar bounces after the last drop"
+ },
+ "dl-side-green-far-2982": {
+  "lift": "dl",
+  "tap": [
+   0.49,
+   0.535
+  ],
+  "expect": "ok",
+  "reps": 1,
+  "why": "side deadlift, green plate far away (small)"
+ },
+ "dl-side-red-yellow-hub-3reps-2912": {
+  "lift": "dl",
+  "tap": [
+   0.49,
+   0.6
+  ],
+  "expect": "ok",
+  "reps": 12,
+  "why": "side deadlift, 12 reps (counted from the track with a frame at every top; the 3 in the name was wrong)"
+ },
+ "sq-front-oblique-2725": {
+  "lift": "sq",
+  "tap": [
+   0.78,
+   0.3
+  ],
+  "expect": "ask",
+  "reps": null,
+  "why": "squat filmed from the front oblique, plate seen edge on"
+ },
+ "sq-identical-plate-on-rack-3458": {
+  "lift": "sq",
+  "tap": [
+   0.5,
+   0.425
+  ],
+  "expect": "ok",
+  "reps": 3,
+  "why": "side squat, identical plates stored on the rack beside the bar"
+ },
+ "sq-identical-plate-on-rack-b-3459": {
+  "lift": "sq",
+  "tap": [
+   0.71,
+   0.42
+  ],
+  "expect": "ok",
+  "reps": 3,
+  "why": "side squat, identical plates on the rack, person walks behind"
+ },
+ "sq-oblique-red-plates-on-rack-2724": {
+  "lift": "sq",
+  "tap": [
+   0.04,
+   0.29
+  ],
+  "expect": "ask",
+  "reps": null,
+  "why": "oblique squat, plate cut by the left edge in the first frame, red decoys"
+ },
+ "sq-side-black-2712": {
+  "lift": "sq",
+  "tap": [
+   0.555,
+   0.16
+  ],
+  "expect": "ok",
+  "reps": 4,
+  "why": "side squat, black bumper near the top of frame"
+ },
+ "sq-side-black-close-2710": {
+  "lift": "sq",
+  "tap": [
+   0.19,
+   0.15
+  ],
+  "expect": "ok",
+  "reps": null,
+  "why": "close side squat, walkout, plate near the left edge; about 4 reps (count from a 1.5 Hz sheet, not exact)"
+ },
+ "sq-side-spotter-behind-3395": {
+  "lift": "sq",
+  "tap": [
+   0.32,
+   0.37
+  ],
+  "expect": "ok",
+  "reps": 5,
+  "why": "side squat, spotter standing behind"
+ },
+ "sq-side-yellow-hub-2843": {
+  "lift": "sq",
+  "tap": [
+   0.28,
+   0.315
+  ],
+  "expect": "ok",
+  "reps": 6,
+  "why": "side squat, identical yellow hub plates on the storage rack"
+ },
+ "sq-spotter-close-2708": {
+  "lift": "sq",
+  "tap": [
+   0.6,
+   0.165
+  ],
+  "expect": "ok",
+  "reps": null,
+  "why": "side squat, spotter steps in close late in the set; about 10 reps (count from a 1.2 Hz sheet, not exact)"
+ },
+ "dl-side-yellow-hub-long-setups-2857": {
+  "lift": "dl",
+  "tap": [
+   0.58,
+   0.475
+  ],
+  "expect": "ok",
+  "reps": 12,
+  "why": "side deadlift, 12 reps with a reset on the floor between each"
+ },
+ "dl-side-yellow-hub-multi-2858": {
+  "lift": "dl",
+  "tap": [
+   0.535,
+   0.525
+  ],
+  "expect": "ok",
+  "reps": 8,
+  "why": "side deadlift, several reps, starts with lifter stretching"
+ },
+ "dl-side-yellow-hub-multi-b-2860": {
+  "lift": "dl",
+  "tap": [
+   0.39,
+   0.525
+  ],
+  "expect": "ok",
+  "reps": 7,
+  "why": "side deadlift, several reps with rests on the floor"
  }
 }
