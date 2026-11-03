@@ -1,5 +1,14 @@
 """ForceTrack bar path: the whole analysis, end to end.
 
+v9 (Nov 2026): the tracker is bp/dp.py (every frame's candidates scored for
+plate evidence, one physically possible path for the whole clip), the seed
+circle is checked against the whole path (bp/dp.rim_check), reps are counted
+without bumper bounces and measured from their first leg, each rep reports
+mean and peak CONCENTRIC velocity, and the track itself can turn an "ok"
+from the plate finder into a "check" (track_doubts), or confirm an unsure
+seed (confirmed_by_track). Measured on 47 of Hayden's clips through the app's
+real upload chain: tests/field.
+
 Latency
 -------
 Decoding is the floor. On this box H.264 1080p decodes at about 280 fps and
@@ -31,6 +40,7 @@ import math, queue, threading, time
 import cv2, numpy as np
 
 import v7
+import dp as _dp
 import snap as _snap
 import ellipse as _el
 from plate import find_plate
@@ -54,6 +64,8 @@ SANE_MAX_MS = 2.0      # above this the tracker is wrong, not the lifter fast
 SANE_MAX_M  = 1.00     # and no squat, bench or deadlift moves the bar a metre
 VEL_WINDOW_S= 0.05     # velocity is measured over this window, not frame to frame
 QUAD        = True     # parabolic resample (False = the old straight line)
+TRACKER     = "dp"     # "dp" (v9, whole clip path with plate evidence) or "v8"
+WORK_MAX    = 480      # px, longest side of a working frame
 
 
 # ---------------------------------------------------------------- decoding
@@ -366,6 +378,14 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
     # ---- forward pass, fed straight off the decoder
     R = seed["r"]
     tsc = min(1.0, v7.TARGET_D / (2.0 * R))
+    # A small seed circle (a hub, or a plate far from the camera) would make
+    # the working frames huge: 2843 seeded on a 33 px hub and tracked at 610 x
+    # 1090, 20 seconds for a 36 second clip. Cap the working frame instead and
+    # let the template be smaller; a plate 30 px across is still found.
+    if small and TRACKER == "dp":
+        long_side = max(small[0].shape[:2]) * tsc
+        if long_side > WORK_MAX:
+            tsc *= WORK_MAX / long_side
     fine = v7.FINE_MULT
     Rw = R * tsc
     efps = fps / step
@@ -379,8 +399,8 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
                 if not pump():
                     return
             g = small[i]; i += 1
-            gw = cv2.resize(g, None, fx=tsc, fy=tsc, interpolation=cv2.INTER_AREA)
             gf = cv2.resize(g, None, fx=tsc * fine, fy=tsc * fine, interpolation=cv2.INTER_AREA)
+            gw = cv2.resize(gf, None, fx=1.0 / fine, fy=1.0 / fine, interpolation=cv2.INTER_AREA)
             GW.append(gw); GF.append(gf)
             yield gw, gf
 
@@ -396,56 +416,130 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
         for x in gen:
             yield x
 
-    def sink(i, p, c):
-        if p is not None and i in fullq:
-            g = fullq.pop(i)
-            X = p[0] / tsc / sc; Y = p[1] / tsc / sc          # source pixels
-            half = int(R / sc * 1.45)
-            x0 = max(0, int(X) - half); y0 = max(0, int(Y) - half)
-            x1 = min(g.shape[1], int(X) + half); y1 = min(g.shape[0], int(Y) + half)
-            if x1 - x0 > 40 and y1 - y0 > 40:
-                crops.append((i, g[y0:y1, x0:x1].copy(), x0, y0, X, Y))
-        elif i in fullq:
-            fullq.pop(i, None)
-        if on_point:
-            on_point(i, None if p is None else p[0] / tsc / sc,
-                     None if p is None else p[1] / tsc / sc, float(c))
-    t0 = time.time()
-    gw_it, gf_it = _split(chain())
-    fwd, cf = v7.pass_dir(gw_it, gf_it, tf, thb, Rw, cap_px, fine,
-                          start=(seed["cx"] * tsc, seed["cy"] * tsc),
-                          hw=GW[0].shape, sink=sink)
-    t_fwd = time.time() - t0
-    stage("forward", t_fwd, len(fwd))
+    def take_crop(i, p):
+        g = fullq.get(i)
+        if g is None or p is None:
+            return
+        X = p[0] / tsc / sc; Y = p[1] / tsc / sc          # source pixels
+        half = int(R / sc * 1.45)
+        x0 = max(0, int(X) - half); y0 = max(0, int(Y) - half)
+        x1 = min(g.shape[1], int(X) + half); y1 = min(g.shape[0], int(Y) + half)
+        if x1 - x0 > 40 and y1 - y0 > 40:
+            crops.append((i, g[y0:y1, x0:x1].copy(), x0, y0, X, Y))
 
-    # ---- reverse pass, over frames already in memory
-    t0 = time.time()
-    tail = None
-    for i in range(len(fwd) - 1, -1, -1):
-        if fwd[i] is not None and cf[i] > 0.35:
-            tail = i; break
-    if tail is None:
-        rev, cr = [None] * len(GW), [0.0] * len(GW)
+    path_info = None
+    if TRACKER == "dp":
+        # ---- v9: candidates with plate evidence on every frame, as the frames
+        #      arrive; one physically possible path for the whole clip at the end
+        t0 = time.time()
+        seed_w = (seed["cx"] * tsc, seed["cy"] * tsc)
+        gx0, gy0 = _dp._grad(GW[0])
+        circ0 = _dp.circle_score(gx0, gy0, seed_w[0], seed_w[1], Rw) or 1.0
+        prof0 = _dp.ring_profile(cv2.GaussianBlur(GW[0].astype(np.float32), (0, 0), 1.0),
+                                 seed_w[0], seed_w[1], Rw)
+        DF = []
+        last = seed_w
+        fb0 = cv2.GaussianBlur(GW[0].astype(np.float32), (0, 0), 1.0)
+        seed_patch = _dp.patch(fb0, seed_w[0], seed_w[1], Rw)
+        c0 = _dp.crop(GW[0], seed_w[0], seed_w[1], Rw)
+        carry = [(seed_w[0], seed_w[1], c0)] if c0 is not None else []
+        near_rad = max(cap_px * 2.0, Rw * 0.6)
+        for k, (gw, gf) in enumerate(chain()):
+            cands = _dp.candidates(gw, gf, tf, Rw, fine, near=last, near_rad=near_rad,
+                                   carry=carry)
+            fr_ = _dp.score_frame(gw, cands, Rw, circ0, prof0)
+            DF.append(fr_)
+            carry = []
+            for j_ in np.argsort(fr_.unary)[:_dp.N_CARRY]:
+                cc = _dp.crop(gw, fr_.xy[j_, 0], fr_.xy[j_, 1], Rw)
+                if cc is not None:
+                    carry.append((fr_.xy[j_, 0], fr_.xy[j_, 1], cc))
+            # a provisional point for the live drawing: the best candidate a
+            # barbell could have reached. The answer itself comes from solve().
+            pick = None
+            if len(fr_.xy):
+                dd = np.hypot(fr_.xy[:, 0] - last[0], fr_.xy[:, 1] - last[1])
+                okk = dd <= near_rad
+                if okk.any():
+                    j = int(np.argmin(np.where(okk, fr_.unary, 1e9)))
+                    pick = (float(fr_.xy[j, 0]), float(fr_.xy[j, 1]))
+                    last = pick
+            if on_point:
+                on_point(k, None if pick is None else pick[0] / tsc / sc,
+                         None if pick is None else pick[1] / tsc / sc,
+                         0.0 if pick is None else float(fr_.ncc[j]))
+        t_fwd = time.time() - t0
+        stage("forward", t_fwd, len(DF))
+        t0 = time.time()
+        dpath = _dp.solve(DF, seed_w, Rw, efps, seed_patch=seed_patch)
+        dpath = _dp.refine_path(dpath, GF, tf, fine)
+        merged = [None if p is None else (p[0], p[1]) for p in dpath]
+        conf = [0.0 if p is None else p[2] for p in dpath]
+        circ = [None if p is None else p[3] for p in dpath]
+        pts = [None if p is None else (p[0] / tsc, p[1] / tsc) for p in merged]
+        out, gaps = _dp.bridge(pts, v7.BRIDGE_MAX)
+        # is the seed circle the rim? asked of the whole path now it is known
+        rim_ratio, rim_score, _prof = _dp.rim_check(GW, dpath, Rw)
+        if rim_ratio != 1.0:
+            R = R * rim_ratio
+            seed["r"] = R
+            stage("rim", rim_ratio, rim_score)
+        for i, p in enumerate(merged):
+            take_crop(i, p)
+        fullq.clear()
+        t_rev = time.time() - t0
+        stage("reverse", t_rev, len(out))
+        vis = [p for p in dpath if p is not None]
+        path_info = {"visited": len(vis), "frames": len(dpath),
+                     "rim_ratio": rim_ratio, "rim_score": rim_score,
+                     "ncc_med": float(np.median([p[2] for p in vis])) if vis else 0.0,
+                     "circ_med": float(np.median([p[3] for p in vis])) if vis else 0.0,
+                     "circ_low": float(np.mean([p[3] < 0.45 for p in vis])) if vis else 1.0,
+                     "shape_med": float(np.median([p[4] for p in vis])) if vis else 0.0,
+                     "shape_low": float(np.mean([p[4] < 0.3 for p in vis])) if vis else 1.0}
     else:
-        rs, cs = v7.pass_dir(GW[tail::-1], GF[tail::-1], tf, thb, Rw, cap_px, fine,
-                             start=fwd[tail])
-        rev = rs[::-1] + [None] * (len(GW) - tail - 1)
-        cr = cs[::-1] + [0.0] * (len(GW) - tail - 1)
-    merged, conf = [], []
-    for a, b, ca, cb in zip(fwd, rev, cf, cr):
-        if a is None and b is None: merged.append(None); conf.append(0.0)
-        elif a is None: merged.append(b); conf.append(cb)
-        elif b is None: merged.append(a); conf.append(ca)
-        elif math.hypot(a[0] - b[0], a[1] - b[1]) < Rw * 0.6:
-            w = ca + cb + 1e-9
-            merged.append(((a[0] * ca + b[0] * cb) / w, (a[1] * ca + b[1] * cb) / w))
-            conf.append(max(ca, cb))
+        def sink(i, p, c):
+            take_crop(i, p)
+            fullq.pop(i, None)
+            if on_point:
+                on_point(i, None if p is None else p[0] / tsc / sc,
+                         None if p is None else p[1] / tsc / sc, float(c))
+        t0 = time.time()
+        gw_it, gf_it = _split(chain())
+        fwd, cf = v7.pass_dir(gw_it, gf_it, tf, thb, Rw, cap_px, fine,
+                              start=(seed["cx"] * tsc, seed["cy"] * tsc),
+                              hw=GW[0].shape, sink=sink)
+        t_fwd = time.time() - t0
+        stage("forward", t_fwd, len(fwd))
+
+        # ---- reverse pass, over frames already in memory
+        t0 = time.time()
+        tail = None
+        for i in range(len(fwd) - 1, -1, -1):
+            if fwd[i] is not None and cf[i] > 0.35:
+                tail = i; break
+        if tail is None:
+            rev, cr = [None] * len(GW), [0.0] * len(GW)
         else:
-            merged.append(a if ca >= cb else b); conf.append(max(ca, cb))
-    pts = [None if p is None else (p[0] / tsc, p[1] / tsc) for p in merged]
-    out, gaps = v7.finish(pts, conf)
-    t_rev = time.time() - t0
-    stage("reverse", t_rev, len(out))
+            rs, cs = v7.pass_dir(GW[tail::-1], GF[tail::-1], tf, thb, Rw, cap_px, fine,
+                                 start=fwd[tail])
+            rev = rs[::-1] + [None] * (len(GW) - tail - 1)
+            cr = cs[::-1] + [0.0] * (len(GW) - tail - 1)
+        merged, conf = [], []
+        for a, b, ca, cb in zip(fwd, rev, cf, cr):
+            if a is None and b is None: merged.append(None); conf.append(0.0)
+            elif a is None: merged.append(b); conf.append(cb)
+            elif b is None: merged.append(a); conf.append(ca)
+            elif math.hypot(a[0] - b[0], a[1] - b[1]) < Rw * 0.6:
+                w = ca + cb + 1e-9
+                merged.append(((a[0] * ca + b[0] * cb) / w, (a[1] * ca + b[1] * cb) / w))
+                conf.append(max(ca, cb))
+            else:
+                merged.append(a if ca >= cb else b); conf.append(max(ca, cb))
+        pts = [None if p is None else (p[0] / tsc, p[1] / tsc) for p in merged]
+        out, gaps = v7.finish(pts, conf)
+        t_rev = time.time() - t0
+        stage("reverse", t_rev, len(out))
 
     # ---- reps and real-world numbers
     Hf = GW[0].shape[0] / tsc
@@ -569,6 +663,7 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
     if fr_src:
         tv_all = [f["t"] for f in fr_src]
         rs = detect_reps(mY, tv_all, min_rom=MIN_REP_M)
+        rs += final_pull(mY, tv_all, rs)
         for rp in rs:
             a, b = rp["start"], rp["end"]
             yv = mY[a:b + 1]; xv = mX[a:b + 1]; tv = tv_all[a:b + 1]
@@ -589,11 +684,22 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
                   for i in range(w, len(yv))]
             peak = float(np.max(vs)) if vs else 0.0
             guessed = float(np.mean(inv[a:b + 1])) if inv else 0.0
-            # A barbell in these lifts does not exceed about 2 m/s. A rep that
-            # says otherwise is not a fast rep, it is a rep the tracker got
-            # wrong, and so is its range of motion. Say so rather than print it.
+            con = concentric(yv, tv, rp["peak"] - a, w)
+            if rp.get("partial") and con is None and rp["peak"] - a >= 3:
+                con = concentric(yv + [yv[-1]] * 3, tv + [tv[-1] + 0.01 * k for k in (1, 2, 3)],
+                                 rp["peak"] - a, w)
+            # Range of motion is the FIRST leg of the rep: top to bottom on a
+            # squat or bench, floor to lockout on a deadlift. Max minus min
+            # over the whole window also counted the walk into the rack after
+            # the last squat (3104: 0.76 and 0.79 m against about 0.70).
+            rom = abs(float(yv[rp["peak"] - a]) - float(yv[0]))
+            if a <= 1:
+                # the clip starts inside this rep (2984 starts with the bar
+                # already off the floor), so its first leg is partial and the
+                # second leg is the only whole one
+                rom = max(rom, abs(float(yv[rp["peak"] - a]) - float(yv[-1])))
+            rom_window = float(max(yv) - min(yv))
             why = []
-            rom = float(max(yv) - min(yv))
             # Range of motion and peak velocity are separate claims and they
             # fail separately. A single jumpy frame wrecks a peak velocity and
             # leaves the range untouched -- on one deadlift rep the range came
@@ -601,7 +707,8 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
             # read 2.96 and 1.41. Refusing the whole rep over the velocity
             # threw away a range that was fine. So say which number is good.
             vel_why = []
-            if peak > SANE_MAX_MS:
+            pc = con["peak_ms"] if con else peak
+            if pc > SANE_MAX_MS:
                 vel_why.append("bar speed above %.1f m/s, which no barbell does "
                                "in these lifts" % SANE_MAX_MS)
             if rom > SANE_MAX_M:
@@ -609,17 +716,38 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
                            "lifts" % (SANE_MAX_M * 100))
             if guessed > 0.15:
                 why.append("bar lost for part of the rep")
-            why += vel_why and [] or []
-            rep_metrics.append({"start": a, "end": b,
+            rep_metrics.append({"start": a, "end": b, "peak": rp["peak"],
                                 "rom_m": round(rom, 3),
+                                "rom_window_m": round(rom_window, 3),
                                 "drift_m": round(float(max(xv) - min(xv)), 3),
                                 "mean_ms": round(float(np.mean(vs)) if vs else 0.0, 3),
                                 "peak_ms": round(peak, 3),
+                                "mean_concentric_ms": None if not con else round(con["mean_ms"], 3),
+                                "peak_concentric_ms": None if not con else round(con["peak_ms"], 3),
+                                "concentric_s": None if not con else round(con["secs"], 2),
+                                "concentric_start_s": None if not con else round(con["t0"], 3),
                                 "measured": not why,
                                 "velocity_ok": not (why or vel_why),
                                 "unmeasured_because": ", ".join(why) or None,
                                 "velocity_unreliable_because":
                                     ", ".join(why + vel_why) or None})
+        rep_metrics = drop_bounces(rep_metrics, mY, tv_all)
+
+    # ---- does the track itself hold up? The verdict used to be the plate
+    #      finder's alone, so a path that left the plate still answered "ok".
+    doubts = track_doubts(fr_src, rep_metrics, ppm_src, path_info,
+                          src_w, src_h, W_ if fr_src else 1.0, H_ if fr_src else 1.0)
+    seed_verdict = verdict
+    if doubts and verdict in ("ok", "given"):
+        verdict = "check"
+    elif not doubts and verdict in ("check", "choose") and confirmed_by_track(path_info, rep_metrics):
+        # The plate finder was unsure from five frames at the tap; the whole
+        # clip has since settled it. The circle it offered first is round, of
+        # that size, around the path, in every part of the set, the path never
+        # does anything a barbell cannot, and every rep measures. Asking the
+        # coach to confirm a circle the clip has already confirmed is the
+        # question that made v8 ask on 16 of 47 clips.
+        verdict = "ok"
 
     stop.set()
     total = time.time() - t_all
@@ -627,6 +755,8 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
     return {"ok": True, "frames_src": fr_src, "rep_metrics": rep_metrics,
             "src_w": src_w, "src_h": src_h, "src_frames": n_src,
             "src_total": src_total, "src_fps": fps, "verdict": verdict, "alternate": alt,
+            "seed_verdict": seed_verdict, "doubts": doubts, "track": path_info,
+            "tracker": TRACKER,
             "seed": {"cx": float(seed["cx"]) / sc, "cy": float(seed["cy"]) / sc,
                      "r": float(R) / sc, "score": seed["score"]},
             "path": [None if p is None else (float(p[0]) / sc, float(p[1]) / sc) for p in out],
@@ -642,6 +772,139 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
             "seconds": total, "video_s": vid_s,
             "realtime_x": (vid_s / total) if total else 0.0,
             "t_seed": t_seed, "t_forward": t_fwd, "t_reverse": t_rev, "error": err}
+
+
+def concentric(yv, tv, k_peak, w, onset_ms=0.05):
+    """The rising leg of one rep, trimmed to the bar actually moving.
+
+    yv is bar height in metres measured DOWNWARDS (image convention), so rising
+    is yv falling. A squat or bench starts high, so its rising leg is the
+    second half (peak to end); a deadlift starts on the floor, so it is the
+    first half (start to peak). The leg starts when the bar's speed first
+    passes 5 cm/s on the way to its fastest point and ends when the bar stops,
+    so the seconds on the floor before a pull, a pause at lockout and a slow
+    creep off the floor (2860 rep 6 read 0.08 m/s with the rest left in) count
+    for nothing. Returns mean and peak velocity in m/s, or None."""
+    n = len(yv)
+    if n < 4 or k_peak <= 0 or k_peak >= n - 1:
+        return None
+    y = np.asarray(yv, float); t = np.asarray(tv, float)
+    if y[k_peak] < y[0]:           # the far end is higher: the first leg rises
+        a, b = 0, k_peak
+    else:                          # the far end is lower: the second leg rises
+        a, b = k_peak, n - 1
+    if b - a < 3:
+        return None
+    seg = y[a:b + 1]; ts = t[a:b + 1]
+    # bottom and top of the leg, then velocity on the window
+    lo = int(np.argmax(seg)); hi = lo + int(np.argmin(seg[lo:]))
+    if hi - lo < 2:
+        return None
+    ww = max(1, w)
+    v = np.zeros(len(seg))
+    for i in range(len(seg)):
+        i0 = max(0, i - ww); i1 = min(len(seg) - 1, i + ww)
+        dt = ts[i1] - ts[i0]
+        v[i] = (seg[i0] - seg[i1]) / dt if dt > 0 else 0.0     # + is rising
+    kmax = lo + int(np.argmax(v[lo:hi + 1]))
+    s0 = kmax
+    while s0 > lo and v[s0] > onset_ms:
+        s0 -= 1
+    e0 = kmax
+    while e0 < hi and v[e0] > onset_ms:
+        e0 += 1
+    dt = ts[e0] - ts[s0]
+    if dt <= 0.05:
+        return None
+    rise = float(seg[s0] - seg[e0])
+    if rise <= 0.02:
+        return None
+    return {"mean_ms": rise / dt, "peak_ms": float(v[s0:e0 + 1].max()),
+            "secs": float(dt), "t0": float(ts[s0])}
+
+
+def final_pull(mY, tv, reps):
+    """A clip that stops at the top of a deadlift (3053 ends at lockout) has
+    lifted the bar and never put it down, so no rep closes. The pull is still
+    a complete concentric and the coach filmed it to see it. Counted when the
+    last leg rises at least 25 cm (and at least half the clip's biggest rep)
+    and the bar is still at least 60% of the way up when the clip ends."""
+    if len(mY) < 6:
+        return []
+    start = reps[-1]["end"] if reps else 0
+    seg = np.asarray(mY[start:], float)
+    if len(seg) < 6:
+        return []
+    lo = int(np.argmax(seg))                       # lowest point (y grows down)
+    if lo >= len(seg) - 3:
+        return []
+    top = lo + int(np.argmin(seg[lo:]))
+    rise = float(seg[lo] - seg[top])
+    need = 0.25
+    if reps:
+        need = max(need, 0.5 * max(float(max(mY[r["start"]:r["end"] + 1]) - min(mY[r["start"]:r["end"] + 1]))
+                                    for r in reps))
+    if rise < need or float(seg[-1] - seg[top]) > 0.4 * rise:
+        return []
+    # shaped like a rep whose far end is the last point
+    return [{"start": start + lo, "peak": start + top, "end": len(mY) - 1, "partial": True}]
+
+
+def drop_bounces(reps, mY, tv):
+    """A bumper plate dropped from lockout bounces 15 to 20 cm in under half a
+    second, and a pivot detector counts that as a rep (2819 counted 3 for 2,
+    2856 5 for 4). A rep is kept only if its range is at least half the
+    biggest rep in the clip, so a bounce, a re-grip or a hitch off the floor
+    after the set never becomes a rep."""
+    if len(reps) < 2:
+        return reps
+    big = max(r["rom_m"] for r in reps)
+    return [r for r in reps if r["rom_m"] >= 0.5 * big]
+
+
+def confirmed_by_track(info, reps):
+    if not info or not reps:
+        return False
+    if info.get("rim_ratio", 1.0) != 1.0 or (info.get("rim_score") or 0) < 0.70:
+        return False
+    if info.get("frames") and info["visited"] < 0.85 * info["frames"]:
+        return False
+    if not all(r.get("measured") for r in reps):
+        return False
+    rom = float(np.median([r["rom_m"] for r in reps]))
+    return 0.15 <= rom <= 0.95
+
+
+def track_doubts(fr_src, reps, ppm, info, src_w, src_h, W_, H_):
+    """Reasons to show the coach the path before trusting its numbers."""
+    out = []
+    if not fr_src:
+        return ["no path"]
+    if info:
+        if info.get("frames") and info["visited"] < 0.6 * info["frames"]:
+            out.append("the plate was not followed for %d%% of the clip"
+                       % round(100 * (1 - info["visited"] / info["frames"])))
+        if info.get("shape_low", 0) > 0.35:
+            out.append("much of the path is not on a round plate")
+    # physically impossible steps between consecutive points
+    if ppm and len(fr_src) > 2:
+        x = np.array([p["x"] for p in fr_src]) * W_ / ppm
+        y = np.array([p["y"] for p in fr_src]) * H_ / ppm
+        t = np.array([p["t"] for p in fr_src])
+        dt = np.diff(t)
+        okd = dt > 0
+        vx = np.abs(np.diff(x))[okd] / dt[okd]; vy = np.diff(y)[okd] / dt[okd]
+        if len(vx) and (vx.max() > 1.5 or (-vy).max() > 3.0 or vy.max() > 5.0):
+            out.append("the path jumps faster than a barbell moves")
+    bad = [r for r in reps if not r.get("measured")]
+    if bad:
+        out.append("%d of %d reps could not be measured (%s)"
+                   % (len(bad), len(reps), bad[0].get("unmeasured_because")))
+    roms = [r["rom_m"] for r in reps if r.get("measured")]
+    if roms and float(np.median(roms)) > 0.95:
+        out.append("every rep reads longer than a barbell travels, so the circle is "
+                   "probably the hub rather than the plate")
+    return out
 
 
 def _split(pairs):

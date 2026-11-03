@@ -130,17 +130,15 @@ def concentric(fr, rep, H, ppm):
 
 
 def render(clip, r, out_jpg, tap):
+    """Eight frames across the clip with the tracked point drawn. Reads only
+    the frames it draws: a full resolution 60 fps clip held in memory whole
+    is several gigabytes."""
     cap = cv2.VideoCapture(clip); fps = cap.get(cv2.CAP_PROP_FPS) or 15
-    frames = []
-    while True:
-        ok, f = cap.read()
-        if not ok:
-            break
-        frames.append(f)
-    cap.release()
-    if not frames:
-        return
-    H, W = frames[0].shape[:2]
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    ok, f0 = cap.read()
+    if not ok:
+        cap.release(); return
+    H, W = f0.shape[:2]
     pts = r.get("frames_src") or []
     sr = r.get("seed") or {}
     rr = sr.get("r", 0) * (W / float(r.get("src_w") or W))
@@ -150,7 +148,7 @@ def render(clip, r, out_jpg, tap):
         b = min(pts, key=lambda p: abs(p["t"] - t))
         return b if abs(b["t"] - t) < 0.3 else None
     tiles = []
-    f0 = frames[0].copy()
+    f0 = f0.copy()
     cv2.drawMarker(f0, (int(tap[0] * W), int(tap[1] * H)), (0, 255, 255), cv2.MARKER_CROSS, 40, 3)
     if sr:
         k = W / float(r.get("src_w") or W)
@@ -159,9 +157,14 @@ def render(clip, r, out_jpg, tap):
     if len(poly) > 1:
         cv2.polylines(f0, [poly], False, (0, 255, 0), 3)
     tiles.append(f0)
-    dur = len(frames) / fps
+    n = n or int((pts[-1]["t"] if pts else 1) * fps)
     for k in range(1, 8):
-        i = min(len(frames) - 1, int(dur * k / 8 * fps)); f = frames[i].copy()
+        i = min(max(0, n - 2), int(n * k / 8))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ok, f = cap.read()
+        if not ok:
+            continue
+        f = f.copy()
         p = at(i / fps)
         if p:
             c = (int(p["x"] * W), int(p["y"] * H))
@@ -170,6 +173,7 @@ def render(clip, r, out_jpg, tap):
             cv2.putText(f, "no point", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 4)
         cv2.putText(f, f"{i / fps:.1f}s", (20, H - 30), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 4)
         tiles.append(f)
+    cap.release()
     tiles = [cv2.resize(t, (225, int(225 * H / W))) for t in tiles]
     cv2.imwrite(out_jpg, np.hstack(tiles), [cv2.IMWRITE_JPEG_QUALITY, 82])
 
@@ -213,6 +217,10 @@ def check(stem, exp, r):
         if rp.get("measured") and not (lo <= rp["rom_m"] <= hi):
             fails.append(f"rom {rp['rom_m']} outside {lo}-{hi}")
         mcv, pcv = concentric(fr, rp, H, ppm)
+        # the pipeline's own mean concentric velocity when it gives one (v9),
+        # else the harness's estimate from the path
+        if rp.get("mean_concentric_ms") is not None:
+            mcv, pcv = rp["mean_concentric_ms"], rp.get("peak_concentric_ms")
         mcvs.append((round(mcv, 3) if mcv else None, round(pcv, 3) if pcv else None))
         if rp.get("measured") and mcv is not None and not (0.05 <= mcv <= 1.6):
             fails.append(f"mcv {mcv:.2f} m/s implausible")
@@ -238,12 +246,14 @@ def main():
     ap.add_argument("--only", nargs="*", default=[])
     ap.add_argument("--step", type=int, default=2)
     ap.add_argument("--full", action="store_true", help="analyse the original clip as is (reference)")
+    ap.add_argument("--resume", action="store_true", help="reuse results already in --out (re-check them, do not re-run)")
+    ap.add_argument("--budget", type=float, default=0, help="stop starting new clips after this many seconds")
     ap.add_argument("--no-shrink", action="store_true", help="skip the 720p phone shrink (older clips kept their original)")
     a = ap.parse_args()
     exps = json.load(open(a.expect))
     out = a.out or os.path.join(a.clips, "_field_results")
     work = os.path.join(out, "app_upload"); os.makedirs(work, exist_ok=True)
-    nfail = 0; rows = []
+    nfail = 0; rows = []; T0 = time.time()
     for stem, exp in sorted(exps.items()):
         if stem.startswith("_"):
             continue
@@ -252,6 +262,17 @@ def main():
         src = next(iter(glob.glob(os.path.join(a.clips, stem + ".*"))), None)
         if not src:
             print(f"{stem}: clip missing"); continue
+        jp = os.path.join(out, stem + ".json")
+        if a.resume and os.path.exists(jp):
+            r = json.load(open(jp)); secs = r.get("_secs", 0)
+            fails, info = check(stem, exp, r)
+            nfail += bool(fails); rows.append((stem, info, secs, fails))
+            print(f"{'FAIL' if fails else 'pass'} {stem[:44]:44s} {str(info['verdict']):7s} reps={info['reps']:<2d} "
+                  f"rom={info['rom']} mcv/pcv={info['mcv_pcv']} worst={info['worst_step_ms']} {secs:.1f}s"
+                  + (("  <- " + "; ".join(fails)) if fails else ""), flush=True)
+            continue
+        if a.budget and time.time() - T0 > a.budget:
+            print(f"{stem}: budget used, run again with --resume"); continue
         t0 = time.time()
         if a.full:
             clip = src
@@ -264,8 +285,8 @@ def main():
                         step=a.step, plate_mm=exp.get("plate_mm", PLATE_MM))
             t0 = t1
         secs = time.time() - t0
-        r.pop("path", None); r.pop("conf", None)
-        json.dump(r, open(os.path.join(out, stem + ".json"), "w"), default=str)
+        r.pop("path", None); r.pop("conf", None); r["_secs"] = round(secs, 2)
+        json.dump(r, open(jp, "w"), default=str)
         try:
             render(clip, r, os.path.join(out, stem + ".jpg"), exp["tap"])
         except Exception as e:
