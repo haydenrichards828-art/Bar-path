@@ -523,8 +523,8 @@ async def analyze_url(request: Request):
         return JSONResponse({"error": f"Bad request: {type(e).__name__}"}, status_code=400)
     why = clip_url_ok(url)
     if why:
-        # The host alone: the rest of a presigned URL is a credential.
-        print(f"[analyze-url] refused ({why}): {urllib.parse.urlsplit(url).hostname}", flush=True)
+        # The reason alone: the rest of a presigned URL is a credential.
+        print(f"[analyze-url] refused ({why})", flush=True)
         return JSONResponse({"error": "That address is not allowed."}, status_code=400)
     coach = request.headers.get("x-barpath-coach", "")[:64] or "unknown"
     tmp = tempfile.mktemp(suffix=".mp4")

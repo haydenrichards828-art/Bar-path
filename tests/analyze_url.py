@@ -75,6 +75,8 @@ for name, url in [
     ("localhost", "http://localhost:8123/health"),
     ("a file", "file:///etc/passwd"),
     ("not a string", 5),
+    ("a broken address", "https://[bad/x"),
+    ("a broken port", "https://acct.r2.cloudflarestorage.com:port/b/k"),
 ]:
     _, r = post("/analyze-url", {"url": url, **tap}); r.read()
     check(f"refused, {name}: 400", r.status == 400, str(r.status))
