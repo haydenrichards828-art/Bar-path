@@ -93,6 +93,17 @@ GAP_ASK     = 0.8      # s; the bar lost this long mid set could hide a rep
 
 
 # ---------------------------------------------------------------- decoding
+# T-9378: a clip the server fetches itself is the phone's 720p file at its own
+# frame rate. The app chain analyses 7.5 frames a second (15 fps, step 2), and
+# the tracker's limits are per analysed frame, so this keeps that rate.
+ANALYSED_HZ = 7.5
+
+
+def direct_step(fps):
+    """Analyse every Nth frame of a clip at this frame rate: 30 fps 4, 60 fps 8."""
+    return max(1, int(round((fps or 30.0) / ANALYSED_HZ)))
+
+
 def _rot(frame, rot):
     if rot == 90:  return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
     if rot == 180: return cv2.rotate(frame, cv2.ROTATE_180)
