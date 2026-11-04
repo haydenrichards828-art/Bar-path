@@ -40,7 +40,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))   # repo root
 
 import cv2, numpy as np
-from bp.pipeline import analyse, PLATE_MM
+from bp.pipeline import analyse, PLATE_MM, direct_step
 
 ROM = {"dl": (0.40, 0.80), "sq": (0.40, 0.90), "bench": (0.20, 0.60)}
 
@@ -252,6 +252,7 @@ def main():
     ap.add_argument("--resume", action="store_true", help="reuse results already in --out (re-check them, do not re-run)")
     ap.add_argument("--budget", type=float, default=0, help="stop starting new clips after this many seconds")
     ap.add_argument("--no-shrink", action="store_true", help="skip the 720p phone shrink (older clips kept their original)")
+    ap.add_argument("--direct", action="store_true", help="the phone's 720p file straight into the analyser (T-9378's /analyze-url)")
     ap.add_argument("--shrink-kbps", type=int, default=2500, help="the phone shrink's bitrate (T-9365's low setting is 1500)")
     a = ap.parse_args()
     exps = json.load(open(a.expect))
@@ -281,6 +282,12 @@ def main():
         if a.full:
             clip = src
             r = analyse(src, tap_norm=tuple(exp["tap"]), rot=rotation_of(src), plate_mm=exp.get("plate_mm", PLATE_MM))
+        elif a.direct:
+            clip = src if a.no_shrink else shrink_720(src, work, a.shrink_kbps)
+            cap = cv2.VideoCapture(clip); fps = cap.get(cv2.CAP_PROP_FPS) or 30.0; cap.release()
+            t0 = time.time()
+            r = analyse(clip, tap_norm=tuple(exp["tap"]), rot=rotation_of(clip), width=None,
+                        step=direct_step(fps), plate_mm=exp.get("plate_mm", PLATE_MM))
         else:
             base = src if a.no_shrink else shrink_720(src, work, a.shrink_kbps)
             clip, seed = emulate_app(base, work)

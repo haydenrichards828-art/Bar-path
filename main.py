@@ -41,12 +41,13 @@ The response shape the app already consumes is unchanged: an NDJSON stream of
 "reps":[...]}. New fields are additive.
 """
 import os, cv2, json, asyncio, hashlib, secrets, shutil, subprocess, tempfile, threading, time
+import urllib.error, urllib.parse, urllib.request
 import numpy as np
 import queue as _queue
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, Request, UploadFile, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from bp.pipeline import analyse, STEP, PLATE_MM
+from bp.pipeline import analyse, direct_step, STEP, PLATE_MM
 
 # No /docs, /redoc or /openapi.json: the only caller is the app's own proxy, and
 # a public schema is a map for everyone else. No CORS either, for the same
@@ -145,12 +146,13 @@ def _reap():
     return len(dead)
 
 
-def _remember(work, tmp, rot):
+def _remember(work, tmp, rot, coach=None, step=None, direct=False, plate_mm=PLATE_MM):
     _reap()
     tok = secrets.token_urlsafe(12)
     with JOBS_LOCK:
         JOBS[tok] = {"work": work, "files": {work, tmp}, "rot": rot, "at": time.time(),
-                     "seed": None, "plate_mm": PLATE_MM, "step": None}
+                     "seed": None, "plate_mm": plate_mm, "step": step,
+                     "coach": coach, "direct": direct, "result": None}
     return tok
 
 
@@ -177,7 +179,8 @@ RATE_WINDOW_S = 600
 RATE_MAX      = 30                 # per coach per 10 min, /analyze and /refine
                                    # together. An analysis and a few corrections
                                    # is under ten; thirty is already a loop.
-GUARDED       = {"/analyze", "/refine"}
+GUARDED       = {"/analyze", "/refine", "/analyze-url", "/result"}
+UNCOUNTED     = {"/result"}            # collecting an answer is not an analysis
 _RATE = {}
 _RATE_LOCK = threading.Lock()
 
@@ -236,7 +239,7 @@ class Gate:
         if declared > MAX_BODY:
             return await _reply(send, 413, {"error": "Upload too large"})
         coach = h.get("x-barpath-coach", b"").decode("latin-1")[:64] or "unknown"
-        wait = _over_rate(coach)
+        wait = 0 if scope["path"] in UNCOUNTED else _over_rate(coach)
         if wait:
             return await _reply(send, 429, {"error": "Too many analyses — try again shortly."},
                                 [(b"retry-after", str(wait).encode())])
@@ -396,10 +399,12 @@ async def refine(job: str = Form(...), circle: str = Form(...)):
 
     async def stream():
         try:
+            with JOBS_LOCK:
+                j["result"] = None
             async for line in _emit(j["work"], j["rot"], None, hint, job,
                                     seed_imgs=j.get("seed"),
                                     plate_mm=j.get("plate_mm", PLATE_MM),
-                                    step=j.get("step")):
+                                    step=j.get("step"), direct=j.get("direct", False)):
                 yield line
         except Exception as e:
             yield json.dumps({"error": str(e)}) + "\n"
@@ -407,8 +412,178 @@ async def refine(job: str = Form(...), circle: str = Form(...)):
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
+# ------------------------------------------------------------------ the clip by URL
+# T-9378 (B-0339 part B). The phone used to download the whole set video, play
+# it through MediaRecorder in real time and upload the result: 30 to 40 seconds
+# for a 20 second clip. Now the app's proxy checks the coach owns the set,
+# presigns a short lived GET and posts only that URL and the tap, and this fetches
+# the phone's own 720p H.264 from R2 straight into the analyser.
+#
+# A URL from outside is the classic way to make a server fetch something it
+# should not, so: https only, the R2 host only, no userinfo, no other port, and
+# NO REDIRECTS, because a redirect is a second URL nobody checked.
+CLIP_HOST_ENV  = "CLIP_HOST"           # exact host, when set; else R2's own suffix
+CLIP_HOST_R2   = ".r2.cloudflarestorage.com"
+CLIP_TEST_ENV  = "CLIP_TEST_HTTP_HOST" # tests/analyze_url.py only; never set on Railway
+MAX_CLIP_BYTES = 300 * 1024 * 1024     # the app takes set videos up to 100 MB;
+                                       # 3 minutes of 720p at 2.5 Mbps is 56 MB
+MAX_CLIP_S     = 300                   # past this it cannot finish in MAX_REQUEST_S
+FETCH_TIMEOUT_S = 60
+FETCH_CHUNK    = 1 << 20
+
+
+class ClipRefused(Exception):
+    pass
+
+
+def clip_url_ok(url):
+    """The reason this URL may not be fetched, or None."""
+    try:
+        u = urllib.parse.urlsplit(url)
+        host, port = (u.hostname or "").lower(), u.port
+    except ValueError:
+        return "not a URL"
+    if u.username or u.password:
+        return "userinfo"
+    test = os.environ.get(CLIP_TEST_ENV, "")
+    if test and u.scheme == "http" and u.netloc == test:
+        return None
+    if u.scheme != "https":
+        return "not https"
+    if port not in (None, 443):
+        return "port"
+    want = os.environ.get(CLIP_HOST_ENV, "").lower()
+    if not (host == want if want else (host.endswith(CLIP_HOST_R2) and len(host) > len(CLIP_HOST_R2))):
+        return "host"
+    return None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def fetch_clip(url, dest, max_bytes=MAX_CLIP_BYTES, timeout=FETCH_TIMEOUT_S):
+    """Stream the clip to `dest` under the size and time limits. Bytes written."""
+    opener = urllib.request.build_opener(_NoRedirect)
+    started = time.time()
+    try:
+        with opener.open(url, timeout=min(15, timeout)) as r, open(dest, "wb") as f:
+            declared = int(r.headers.get("content-length") or 0)
+            if declared > max_bytes:
+                raise ClipRefused("too large")
+            got = 0
+            while True:
+                chunk = r.read(FETCH_CHUNK)
+                if not chunk:
+                    return got
+                got += len(chunk)
+                if got > max_bytes:
+                    raise ClipRefused("too large")
+                if time.time() - started > timeout:
+                    raise ClipRefused("too slow")
+                f.write(chunk)
+    except urllib.error.HTTPError as e:
+        raise ClipRefused(f"status {e.code}")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise ClipRefused(f"unreachable: {type(e).__name__}")
+
+
+CLIP_MESSAGES = {
+    "too large": "This video is too large to analyse. Trim it to the lift and try again.",
+    "too long": "This video is too long to analyse. Trim it to the lift and try again.",
+}
+CLIP_FAILED = "Could not read this video from storage. Try again."
+
+
+def clip_seconds(path):
+    pc = cv2.VideoCapture(path)
+    try:
+        fps = pc.get(cv2.CAP_PROP_FPS) or 30.0
+        return (pc.get(cv2.CAP_PROP_FRAME_COUNT) or 0) / fps, fps
+    finally:
+        pc.release()
+
+
+@app.post("/analyze-url")
+async def analyze_url(request: Request):
+    """The same NDJSON stream as /analyze, from a clip this service fetches. The
+    first line names the job, so an answer outlives the connection: the proxy
+    can be cut at its own time limit and the phone can lose signal, and the app
+    collects the result from /result."""
+    t0 = time.time()
+    try:
+        body = json.loads(await request.body())
+        url = body["url"]
+        tap_norm = (float(body.get("start_x", 0.5)), float(body.get("start_y", 0.5)))
+        plate_mm = float(body.get("plate_mm", PLATE_MM))
+        if not isinstance(url, str) or not all(0 <= v <= 1 for v in tap_norm) or plate_mm <= 0:
+            raise ValueError("bad value")
+    except Exception as e:
+        return JSONResponse({"error": f"Bad request: {type(e).__name__}"}, status_code=400)
+    why = clip_url_ok(url)
+    if why:
+        # The host alone: the rest of a presigned URL is a credential.
+        print(f"[analyze-url] refused ({why}): {urllib.parse.urlsplit(url).hostname}", flush=True)
+        return JSONResponse({"error": "That address is not allowed."}, status_code=400)
+    coach = request.headers.get("x-barpath-coach", "")[:64] or "unknown"
+    tmp = tempfile.mktemp(suffix=".mp4")
+
+    async def stream():
+        keep = False
+        work = tmp
+        try:
+            size = await asyncio.to_thread(fetch_clip, url, tmp)
+            fetched = time.time() - t0
+            secs, fps = clip_seconds(tmp)
+            if secs > MAX_CLIP_S:
+                raise ClipRefused("too long")
+            work = normalise_video(tmp)
+            rot = get_rotation(work)
+            step = direct_step(fps)
+            token = _remember(work, tmp, rot, coach=coach, step=step, direct=True, plate_mm=plate_mm)
+            keep = True
+            print(f"[analyze-url] {token} {size} bytes {secs:.1f}s fetched in {fetched:.2f}s", flush=True)
+            async for line in _emit(work, rot, tap_norm, None, token, plate_mm=plate_mm,
+                                    step=step, direct=True, t0=t0, fetched=fetched):
+                yield line
+        except ClipRefused as e:
+            print(f"[analyze-url] clip refused: {e}", flush=True)
+            yield json.dumps({"error": CLIP_MESSAGES.get(str(e), CLIP_FAILED)}) + "\n"
+        except Exception as e:
+            print(f"[analyze-url] failed: {e!r}", flush=True)
+            yield json.dumps({"error": str(e)}) + "\n"
+        finally:
+            if not keep:
+                for f in {tmp, work}:
+                    try: os.unlink(f)
+                    except Exception: pass
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+@app.post("/result")
+async def result(request: Request):
+    """The last line of a job's analysis, once it has one. Only for the coach who
+    started it: a job name is hard to guess, and this is the second lock."""
+    try:
+        job = json.loads(await request.body())["job"]
+    except Exception:
+        return JSONResponse({"error": "Bad request"}, status_code=400)
+    coach = request.headers.get("x-barpath-coach", "")[:64] or "unknown"
+    with JOBS_LOCK:
+        j = JOBS.get(job) if isinstance(job, str) else None
+        line = j.get("result") if j else None
+    if not j or j.get("coach") != coach:
+        return JSONResponse({"error": "That clip is no longer on the server — "
+                                      "please analyse it again."}, status_code=410)
+    if line is None:
+        return JSONResponse({"pending": True})
+    return StreamingResponse(iter([line]), media_type="application/x-ndjson")
+
+
 async def _emit(work, rot, tap_norm, seed_hint, token, seed_imgs=None,
-                plate_mm=PLATE_MM, step=None):
+                plate_mm=PLATE_MM, step=None, direct=False, t0=None, fetched=None):
     """Bridge the blocking pipeline into an async NDJSON stream."""
     global GATE
     if GATE is None:
@@ -417,7 +592,7 @@ async def _emit(work, rot, tap_norm, seed_hint, token, seed_imgs=None,
     held = {}
     try:
         async for line in _emit_inner(work, rot, tap_norm, seed_hint, token,
-                                      seed_imgs, plate_mm, step, held):
+                                      seed_imgs, plate_mm, step, held, direct, t0, fetched):
             yield line
     finally:
         # The pipeline cannot be interrupted. If the stream ends while it is
@@ -443,83 +618,20 @@ async def _release_when_done(worker):
         GATE.release()
 
 
-async def _emit_inner(work, rot, tap_norm, seed_hint, token, seed_imgs=None,
-                      plate_mm=PLATE_MM, step=None, held=None):
-    out = _queue.Queue()
-    box = {}
-
-    def on_point(i, x, y, c):
-        out.put(("p", i))
-
-    def run():
-        try:
-            kw = {}
-            if seed_imgs:
-                # the clip was shrunk before upload, so the tracker works in
-                # clip pixels while the plate was measured in still pixels
-                kw = dict(seed_images=seed_imgs, width=None, step=step or 2)
-            elif step:
-                kw = dict(step=step)
-            box["r"] = analyse(work, tap_norm=tap_norm, rot=rot, seed_hint=seed_hint,
-                               on_point=on_point, plate_mm=plate_mm, **kw)
-        except Exception as e:
-            box["e"] = e
-        finally:
-            out.put(("end", None))
-
-    # The progress bar counts the messages below, so total_frames must be the
-    # number of ANALYSED frames, not the clip's own frame count. Probing for it
-    # costs about ten milliseconds and has to happen before the first tick.
-    src_total, src_fps = 0, 30.0
-    try:
-        pc = cv2.VideoCapture(work)
-        src_total = int(pc.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        src_fps = pc.get(cv2.CAP_PROP_FPS) or 30.0
-        pc.release()
-    except Exception as e:
-        print(f"[analyze] frame-count probe failed: {e}", flush=True)
-    eff_step = (step or (2 if seed_imgs else STEP))
-    analysed_total = max(1, -(-src_total // eff_step)) if src_total else 0
-    yield json.dumps({"meta": {"total_frames": analysed_total, "fps": src_fps,
-                               "source_frames": src_total, "step": eff_step}}) + "\n"
-
-    started = time.time()
-    worker = threading.Thread(target=run, daemon=True)
-    worker.start()
-    if held is not None:
-        held["worker"] = worker
-
-    while True:
-        try:
-            kind, val = out.get_nowait()
-        except _queue.Empty:
-            if time.time() - started > MAX_REQUEST_S:
-                # The coach gets an answer now; the worker keeps its slot
-                # until it ends (see _emit).
-                print(f"[analyze] over {MAX_REQUEST_S}s, giving up", flush=True)
-                yield json.dumps({"error": "The analysis took too long. Trim the "
-                                           "video to the lift itself and try again."}) + "\n"
-                return
-            await asyncio.sleep(0.02)
-            continue
-        if kind == "end":
-            break
-        yield json.dumps({"frame": {"i": val}}) + "\n"
-
+def _final_line(box, rot, token, started, seconds_to=None):
+    """The stream's last line, also kept on the job for /result."""
     if "e" in box:
         print(f"[analyze] pipeline error: {box['e']!r}", flush=True)
-        yield json.dumps({"error": str(box["e"])}) + "\n"
-        return
+        return json.dumps({"error": str(box["e"])}) + "\n"
     r = box.get("r") or {}
     if not r.get("ok"):
-        yield json.dumps({"error": REFUSE_MSG if r.get("verdict") == "refuse"
-                          else (r.get("reason") or "Analysis failed"),
-                          "verdict": r.get("verdict")}) + "\n"
-        return
+        return json.dumps({"error": REFUSE_MSG if r.get("verdict") == "refuse"
+                           else (r.get("reason") or "Analysis failed"),
+                           "verdict": r.get("verdict")}) + "\n"
     print(f"[analyze] verdict={r['verdict']} seed={r['seed']} "
           f"{r['seconds']:.2f}s {r['realtime_x']:.2f}xRT tracked={r['tracked']}/{r['frames']}",
           flush=True)
-    yield json.dumps({
+    return json.dumps({
         "done": True,
         "frames": r["frames_src"],
         "reps": r["rep_metrics"],
@@ -544,4 +656,111 @@ async def _emit_inner(work, rot, tap_norm, seed_hint, token, seed_imgs=None,
         "gaps": len(r.get("gaps") or []),
         "seconds": round(r["seconds"], 2),
         "server_s": round(time.time() - started, 2),
+        **(seconds_to or {}),
     }) + "\n"
+
+
+async def _emit_inner(work, rot, tap_norm, seed_hint, token, seed_imgs=None,
+                      plate_mm=PLATE_MM, step=None, held=None, direct=False, t0=None, fetched=None):
+    out = _queue.Queue()
+    box = {}
+    timing = {}                      # T-9378: filled only on the URL path
+    finished = {}
+
+    def on_point(i, x, y, c):
+        if t0 is not None and "first_point_s" not in timing:
+            timing["first_point_s"] = round(time.time() - t0, 2)
+            print(f"[analyze-url] {token} first point at {timing['first_point_s']}s", flush=True)
+        out.put(("p", (i, x, y, c)))
+
+    def run():
+        try:
+            kw = {}
+            if direct:
+                # the phone's own file, seeded from its own frames at full
+                # quality; the tracker works in its pixels at the same analysed
+                # rate as the app chain (see bp.pipeline.direct_step)
+                kw = dict(width=None, step=step)
+            elif seed_imgs:
+                # the clip was shrunk before upload, so the tracker works in
+                # clip pixels while the plate was measured in still pixels
+                kw = dict(seed_images=seed_imgs, width=None, step=step or 2)
+            elif step:
+                kw = dict(step=step)
+            box["r"] = analyse(work, tap_norm=tap_norm, rot=rot, seed_hint=seed_hint,
+                               on_point=on_point, plate_mm=plate_mm, **kw)
+        except Exception as e:
+            box["e"] = e
+        finally:
+            if t0 is not None:
+                timing["fetch_s"] = round(fetched or 0, 2)
+                timing["done_s"] = round(time.time() - t0, 2)
+                print(f"[analyze-url] {token} done at {timing['done_s']}s "
+                      f"(fetch {timing['fetch_s']}s, first point {timing.get('first_point_s')}s)", flush=True)
+            # Kept on the job first: the stream may already have gone (the
+            # proxy's time limit, the phone's signal) and the worker is the one
+            # thing that still knows the answer.
+            finished["line"] = _final_line(box, rot, token, started, timing)
+            with JOBS_LOCK:
+                if token in JOBS:
+                    JOBS[token]["result"] = finished["line"]
+            out.put(("end", None))
+
+    # The progress bar counts the messages below, so total_frames must be the
+    # number of ANALYSED frames, not the clip's own frame count. Probing for it
+    # costs about ten milliseconds and has to happen before the first tick.
+    src_total, src_fps = 0, 30.0
+    cap_w = cap_h = 0
+    try:
+        pc = cv2.VideoCapture(work)
+        src_total = int(pc.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        src_fps = pc.get(cv2.CAP_PROP_FPS) or 30.0
+        if direct:
+            pc.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
+            cap_w, cap_h = int(pc.get(cv2.CAP_PROP_FRAME_WIDTH)), int(pc.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if rot in (90, 270):
+                cap_w, cap_h = cap_h, cap_w
+        pc.release()
+    except Exception as e:
+        print(f"[analyze] frame-count probe failed: {e}", flush=True)
+    eff_step = (step or (2 if seed_imgs else STEP))
+    analysed_total = max(1, -(-src_total // eff_step)) if src_total else 0
+    meta = {"total_frames": analysed_total, "fps": src_fps,
+            "source_frames": src_total, "step": eff_step}
+    if direct:
+        meta.update(job=token, cap_w=cap_w, cap_h=cap_h)
+    yield json.dumps({"meta": meta}) + "\n"
+
+    started = time.time()
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    if held is not None:
+        held["worker"] = worker
+
+    while True:
+        try:
+            kind, val = out.get_nowait()
+        except _queue.Empty:
+            if time.time() - started > MAX_REQUEST_S:
+                # The coach gets an answer now; the worker keeps its slot
+                # until it ends (see _emit).
+                print(f"[analyze] over {MAX_REQUEST_S}s, giving up", flush=True)
+                yield json.dumps({"error": "The analysis took too long. Trim the "
+                                           "video to the lift itself and try again."}) + "\n"
+                return
+            await asyncio.sleep(0.02)
+            continue
+        if kind == "end":
+            break
+        i, x, y, c = val
+        frame = {"i": i}
+        if direct:
+            # the live drawing: a provisional point, in the clip's pixels. The
+            # answer is the last line. Only this path: /analyze's lines stay
+            # byte for byte what tests/same_path.py compares.
+            frame.update(t=round(i * eff_step / src_fps, 3),
+                         x=None if x is None else round(x, 1),
+                         y=None if y is None else round(y, 1))
+        yield json.dumps({"frame": frame}) + "\n"
+
+    yield finished["line"]
