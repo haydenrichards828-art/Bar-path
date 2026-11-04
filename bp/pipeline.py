@@ -66,6 +66,8 @@ VEL_WINDOW_S= 0.05     # velocity is measured over this window, not frame to fra
 QUAD        = True     # parabolic resample (False = the old straight line)
 TRACKER     = "dp"     # "dp" (v9, whole clip path with plate evidence) or "v8"
 WORK_MAX    = 480      # px, longest side of a working frame
+HUB_ASK     = 15.0     # seed interior this much brighter than its surround: a hub
+MCV_MAX     = 1.3      # m/s mean concentric; faster is the tracker, not the lifter
 
 
 # ---------------------------------------------------------------- decoding
@@ -368,6 +370,14 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
             alt = {"cx": float(a["cx"]), "cy": float(a["cy"]), "r": float(a["r"]),
                    "score": float(a.get("score", 0.0))}
     t_seed = time.time() - t0
+    # is the seed circle brighter inside than just outside it? That is a hub
+    # (a chrome boss or a coloured insert in a dark plate), not a plate's rim.
+    # Measured on the 47 field clips: the hubs read +10 to +40, real rims -80
+    # to +5. Kept for track_doubts, which asks when no rim was found outside it.
+    try:
+        seed_hub = float(_snap._hubness(big[0], seed["cx"] / sc, seed["cy"] / sc, seed["r"] / sc))
+    except Exception:
+        seed_hub = 0.0
     big.clear()
     stage("seed", t_seed, verdict)
     if verdict == "refuse":
@@ -711,6 +721,9 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
             if pc > SANE_MAX_MS:
                 vel_why.append("bar speed above %.1f m/s, which no barbell does "
                                "in these lifts" % SANE_MAX_MS)
+            if con and con["mean_ms"] > MCV_MAX:
+                vel_why.append("mean concentric speed above %.1f m/s, faster than a "
+                               "loaded bar is lifted" % MCV_MAX)
             if rom > SANE_MAX_M:
                 why.append("range above %.0f cm, which no barbell does in these "
                            "lifts" % (SANE_MAX_M * 100))
@@ -737,6 +750,9 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
     #      finder's alone, so a path that left the plate still answered "ok".
     doubts = track_doubts(fr_src, rep_metrics, ppm_src, path_info,
                           src_w, src_h, W_ if fr_src else 1.0, H_ if fr_src else 1.0)
+    if seed_hub >= HUB_ASK and (path_info or {}).get("rim_ratio", 1.0) == 1.0:
+        doubts.append("the circle looks like the plate's hub, not its rim, and the "
+                      "rim could not be found (cut off by the frame?)")
     seed_verdict = verdict
     if doubts and verdict in ("ok", "given"):
         verdict = "check"
@@ -780,11 +796,10 @@ def concentric(yv, tv, k_peak, w, onset_ms=0.05):
     yv is bar height in metres measured DOWNWARDS (image convention), so rising
     is yv falling. A squat or bench starts high, so its rising leg is the
     second half (peak to end); a deadlift starts on the floor, so it is the
-    first half (start to peak). The leg starts when the bar's speed first
-    passes 5 cm/s on the way to its fastest point and ends when the bar stops,
-    so the seconds on the floor before a pull, a pause at lockout and a slow
-    creep off the floor (2860 rep 6 read 0.08 m/s with the rest left in) count
-    for nothing. Returns mean and peak velocity in m/s, or None."""
+    first half (start to peak). The leg is trimmed to the bar moving (see
+    below), so the seconds on the floor before a pull and a pause at lockout
+    count for nothing (2860 rep 6 read 0.08 m/s with the rest left in).
+    Returns mean and peak velocity in m/s, or None."""
     n = len(yv)
     if n < 4 or k_peak <= 0 or k_peak >= n - 1:
         return None
@@ -806,13 +821,49 @@ def concentric(yv, tv, k_peak, w, onset_ms=0.05):
         i0 = max(0, i - ww); i1 = min(len(seg) - 1, i + ww)
         dt = ts[i1] - ts[i0]
         v[i] = (seg[i0] - seg[i1]) / dt if dt > 0 else 0.0     # + is rising
-    kmax = lo + int(np.argmax(v[lo:hi + 1]))
-    s0 = kmax
-    while s0 > lo and v[s0] > onset_ms:
-        s0 -= 1
-    e0 = kmax
-    while e0 < hi and v[e0] > onset_ms:
-        e0 += 1
+    # the fastest point OF THE MAIN RISE, between 20% and 80% of the way up:
+    # a bumper bouncing off the floor before the pull is faster than the pull
+    # itself and used to be taken as the rep (2857 rep 9)
+    b0, t0_ = float(seg[lo]), float(seg[hi])
+    span = b0 - t0_
+    mid = [i for i in range(lo, hi + 1) if 0.2 * span <= b0 - seg[i] <= 0.8 * span]
+    kmax = max(mid, key=lambda i: v[i]) if mid else lo + int(np.argmax(v[lo:hi + 1]))
+    # trim by position, not by speed. A speed threshold ended the leg at a
+    # deadlift's sticking point; a "within 1 cm of the top" rule let a lifter
+    # settling into lockout stretch the leg by a second (2843 rep 1 read 0.21
+    # m/s against 0.6 for the other five). So the leg runs from 3% of the rise
+    # to 97% of it (at least 1 cm each end), which keeps the sticking point
+    # and drops the creep at either end.
+    # the bottom and top are where the bar was AT REST either side of its
+    # fastest point, not the extremes of the window: a dropped deadlift
+    # bottoms out 2 cm below where it then sits (2860 rep 6 read 0.08 m/s
+    # because the leg started at the bounce, seven seconds before the pull)
+    def rest(k, d):
+        i = k
+        while 0 < i < len(seg) - 1:
+            j = i
+            while 0 <= j + d < len(seg) and abs(ts[j + d] - ts[i]) < 0.2:
+                j += d
+            if j == i or abs(float(seg[j] - seg[i])) < 0.01:
+                return i
+            i += d
+        return i
+    lo = rest(kmax, -1); hi = rest(kmax, +1)
+    if hi - lo < 2:
+        return None
+    bot, top = float(seg[lo]), float(seg[hi])
+    total = bot - top
+    if total <= 0.03:
+        return None
+    m = max(0.01, 0.03 * total)
+    s0 = lo
+    while s0 < hi and bot - seg[s0] < m:
+        s0 += 1
+    e0 = hi
+    while e0 > s0 and seg[e0] - top < m:
+        e0 -= 1
+    e0 = min(hi, e0 + 1)
+    s0 = max(lo, s0 - 1)
     dt = ts[e0] - ts[s0]
     if dt <= 0.05:
         return None
@@ -894,12 +945,16 @@ def track_doubts(fr_src, reps, ppm, info, src_w, src_h, W_, H_):
         dt = np.diff(t)
         okd = dt > 0
         vx = np.abs(np.diff(x))[okd] / dt[okd]; vy = np.diff(y)[okd] / dt[okd]
-        if len(vx) and (vx.max() > 1.5 or (-vy).max() > 3.0 or vy.max() > 5.0):
+        if len(vx) and (vx.max() > 1.2 or (-vy).max() > 2.5 or vy.max() > 4.5):
             out.append("the path jumps faster than a barbell moves")
     bad = [r for r in reps if not r.get("measured")]
     if bad:
         out.append("%d of %d reps could not be measured (%s)"
                    % (len(bad), len(reps), bad[0].get("unmeasured_because")))
+    slow = [r for r in reps if r.get("measured") and not r.get("velocity_ok")]
+    if slow:
+        out.append("%d of %d reps have a speed no loaded bar reaches (%s)"
+                   % (len(slow), len(reps), slow[0].get("velocity_unreliable_because")))
     roms = [r["rom_m"] for r in reps if r.get("measured")]
     if roms and float(np.median(roms)) > 0.95:
         out.append("every rep reads longer than a barbell travels, so the circle is "
