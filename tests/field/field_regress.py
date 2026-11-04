@@ -62,16 +62,16 @@ def rotation_of(path):
     return 0
 
 
-def shrink_720(src, work):
+def shrink_720(src, work, kbps=2500):
     """T-9300's phone shrink (src/lib/video-shrink.ts) before the set video is
     uploaded: short edge 720, H.264 at 2.5 Mbps, every frame kept. What is in
     R2, and therefore what the bar path analyser starts from, is this file."""
     stem = os.path.splitext(os.path.basename(src))[0]
-    out = os.path.join(work, stem + ".r2.mp4")
+    out = os.path.join(work, stem + (".r2.mp4" if kbps == 2500 else f".r2-{kbps}k.mp4"))
     if not os.path.exists(out):
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", src,
                         "-vf", "scale=w='if(gt(iw,ih),-2,min(720,iw))':h='if(gt(iw,ih),min(720,ih),-2)'",
-                        "-c:v", "libx264", "-preset", "veryfast", "-b:v", "2500k", "-pix_fmt", "yuv420p",
+                        "-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{kbps}k", "-pix_fmt", "yuv420p",
                         "-an", out], check=True)
     return out
 
@@ -252,6 +252,7 @@ def main():
     ap.add_argument("--resume", action="store_true", help="reuse results already in --out (re-check them, do not re-run)")
     ap.add_argument("--budget", type=float, default=0, help="stop starting new clips after this many seconds")
     ap.add_argument("--no-shrink", action="store_true", help="skip the 720p phone shrink (older clips kept their original)")
+    ap.add_argument("--shrink-kbps", type=int, default=2500, help="the phone shrink's bitrate (T-9365's low setting is 1500)")
     a = ap.parse_args()
     exps = json.load(open(a.expect))
     out = a.out or os.path.join(a.clips, "_field_results")
@@ -281,7 +282,7 @@ def main():
             clip = src
             r = analyse(src, tap_norm=tuple(exp["tap"]), rot=rotation_of(src), plate_mm=exp.get("plate_mm", PLATE_MM))
         else:
-            base = src if a.no_shrink else shrink_720(src, work)
+            base = src if a.no_shrink else shrink_720(src, work, a.shrink_kbps)
             clip, seed = emulate_app(base, work)
             t1 = time.time()
             r = analyse(clip, tap_norm=tuple(exp["tap"]), rot=0, seed_images=seed, width=None,
