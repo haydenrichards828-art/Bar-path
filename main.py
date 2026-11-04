@@ -52,7 +52,7 @@ from bp.pipeline import analyse, STEP, PLATE_MM
 # a public schema is a map for everyone else. No CORS either, for the same
 # reason — since T-9056 no browser calls this service directly, so a browser
 # that tries is refused by its own same-origin rule as well as by the key.
-app = FastAPI(title="ForceTrack Bar Path API", version="9.0.0",
+app = FastAPI(title="ForceTrack Bar Path API", version="10.0.0",
               docs_url=None, redoc_url=None, openapi_url=None)
 
 PLATE_DIAMETER_M = 0.450
@@ -532,6 +532,8 @@ async def _emit_inner(work, rot, tap_norm, seed_hint, token, seed_imgs=None,
         # the plate finder's own verdict before the track confirmed or doubted it
         "doubts": r.get("doubts") or [],
         "seed_verdict": r.get("seed_verdict"),
+        # v10: tracked again from a better circle (why, and which pass was kept)
+        "second_look": r.get("second_look"),
         "plate_mm": r.get("plate_mm"),
         "off_square_deg": r.get("off_square_deg"),
         "scale_model": r.get("scale_model"),

@@ -37,6 +37,7 @@ v9 does three things instead:
      the first seconds of a set when a bench bar leaves the hooks.
 """
 import math
+import warnings
 import cv2
 import numpy as np
 
@@ -74,23 +75,21 @@ N_ANG      = 64
 # passes in front of dark clothing), and template correlation least of all.
 
 
-_GCACHE = [None, None]
-
-
-def _grad(gw):
-    """Smoothed frame and its gradient, computed once per frame."""
-    if _GCACHE[0] is gw:
-        return _GCACHE[1][1], _GCACHE[1][2]
+def _fgrad(gw):
+    """Smoothed frame and its gradient."""
     f = cv2.GaussianBlur(gw.astype(np.float32), (0, 0), 1.0)
     gx = cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3)
-    _GCACHE[0] = gw; _GCACHE[1] = (f, gx, gy)
+    return f, gx, gy
+
+
+def _grad(gw):
+    f, gx, gy = _fgrad(gw)
     return gx, gy
 
 
 def _blur(gw):
-    _grad(gw)
-    return _GCACHE[1][0]
+    return cv2.GaussianBlur(gw.astype(np.float32), (0, 0), 1.0)
 
 
 _ANG = np.linspace(0, 2 * math.pi, N_ANG, endpoint=False)
@@ -114,7 +113,7 @@ def circle_score(gx, gy, cx, cy, R):
     return float(max(np.median(rad[k][ok[k]]) for k in range(3) if ok[k].any()))
 
 
-def vote_peaks(gw, R, k=6):
+def vote_peaks(gw, R, k=6, grad=None):
     """Fixed radius circle votes: every strong edge votes for the points R away
     along its gradient, both ways. A plate's rim is round whatever way the
     plate has turned, so this finds it when the template does not: a bar that
@@ -122,7 +121,7 @@ def vote_peaks(gw, R, k=6):
     pull, which is what template correlation never survived. Returns a list of
     (x, y, votes) in working pixels."""
     H, W = gw.shape
-    gx, gy = _grad(gw)
+    gx, gy = grad if grad is not None else _grad(gw)
     mag = np.hypot(gx, gy)
     flat = mag.ravel()
     thr = max(8.0, float(np.partition(flat, int(len(flat) * 0.8))[int(len(flat) * 0.8)]))
@@ -148,7 +147,8 @@ def vote_peaks(gw, R, k=6):
     return out
 
 
-def candidates(gw, gf, tpl_full, R, fine, near=None, near_rad=None, carry=None):
+def candidates(gw, gf, tpl_full, R, fine=None, near=None, near_rad=None, carry=None,
+               grad=None, want_maps=False):
     """Template peaks over the whole frame, the best template match in a
     window around `near`, the strongest fixed radius circles, and the previous
     frame's best candidates followed into this frame by their own appearance
@@ -203,7 +203,7 @@ def candidates(gw, gf, tpl_full, R, fine, near=None, near_rad=None, carry=None):
             res[fy0:fy0 + r2.shape[0], fx0:fx0 + r2.shape[1]] = r2
             _, m2, _, l2 = cv2.minMaxLoc(r2)
             raw.append((fx0 + l2[0] + t_w.shape[1] / 2 - pad, fy0 + l2[1] + t_w.shape[0] / 2 - pad, m2, t_f))
-        maps.append((res, t_w, t_f))
+        maps.append((res, t_w, t_f, gwp))
         if near is not None:
             x0 = int(max(0, near[0] + pad - near_rad - t_w.shape[1] / 2))
             y0 = int(max(0, near[1] + pad - near_rad - t_w.shape[0] / 2))
@@ -222,7 +222,7 @@ def candidates(gw, gf, tpl_full, R, fine, near=None, near_rad=None, carry=None):
         out.append((x, y, float(s)))
         if len(out) >= 8:
             break
-    extra = list(vote_peaks(gw, R))
+    extra = list(vote_peaks(gw, R, grad=grad))
     # the previous frame's candidates, followed by what they looked like a
     # frame ago rather than at the seed: a plate passing in front of the
     # lifter's legs at lockout looks little like the plate on the floor at the
@@ -244,15 +244,8 @@ def candidates(gw, gf, tpl_full, R, fine, near=None, near_rad=None, carry=None):
     for x, y, _v in extra:
         if any(math.hypot(x - o[0], y - o[1]) < R * 0.3 for o in out):
             continue
-        best = 0.0
-        for res, t_w, _tf in maps:
-            cx = int(round(x + pad - t_w.shape[1] / 2)); cy = int(round(y + pad - t_w.shape[0] / 2))
-            x0, y0 = max(0, cx - 2), max(0, cy - 2)
-            x1, y1 = min(res.shape[1], cx + 3), min(res.shape[0], cy + 3)
-            if x1 > x0 and y1 > y0:
-                best = max(best, float(res[y0:y1, x0:x1].max()))
-        out.append((x, y, best))
-    return out
+        out.append((x, y, _ncc_at(maps, x, y, pad)))
+    return (out, maps) if want_maps else out
 
 
 _SA48 = np.linspace(0, 2 * math.pi, 48, endpoint=False)
@@ -337,23 +330,170 @@ class Frame:
     pass
 
 
-def score_frame(gw, cands, R, circ0, prof0=None):
-    gx, gy = _grad(gw)
-    fb = _blur(gw)
+class Ctx:
+    """What one frame needs from the parallel stage."""
+    pass
+
+
+def prepare(gw, gf, tpl_full, R):
+    """The part of a frame's work that needs nothing from the frame before it:
+    the smoothed frame and its gradient, template peaks over the whole frame,
+    and the circle votes. Safe to run on several frames at once (OpenCV and the
+    big numpy calls release the interpreter lock)."""
+    c = Ctx()
+    c.gw = gw; c.gf = gf
+    c.fb, c.gx, c.gy = _fgrad(gw)
+    c.cands, c.maps = candidates(gw, gf, tpl_full, R, grad=(c.gx, c.gy), want_maps=True)
+    return c
+
+
+def finish(c, R, circ0, prof0, carry=None, carry_rad=None):
+    """The sequential part: follow the previous frame's best candidates into
+    this one, then score everything at once."""
+    out = list(c.cands)
+    pad = int(R)
+    for x, y, tpl in (carry or []):
+        h, w = tpl.shape
+        rad = carry_rad or R
+        x0 = int(max(0, x - rad - w / 2)); y0 = int(max(0, y - rad - h / 2))
+        x1 = int(min(c.gw.shape[1], x + rad + w / 2)); y1 = int(min(c.gw.shape[0], y + rad + h / 2))
+        win = c.gw[y0:y1, x0:x1]
+        if win.shape[0] <= h or win.shape[1] <= w:
+            continue
+        res = cv2.matchTemplate(win, tpl, cv2.TM_CCOEFF_NORMED)
+        _, mx, _, loc = cv2.minMaxLoc(res)
+        if mx < 0.4:
+            continue
+        px, py = x0 + loc[0] + w / 2.0, y0 + loc[1] + h / 2.0
+        if any(math.hypot(px - o[0], py - o[1]) < R * 0.3 for o in out):
+            continue
+        out.append((px, py, _ncc_at(c.maps, px, py, pad)))
+    return score_frame(c.gw, out, R, circ0, prof0, fgr=(c.fb, c.gx, c.gy))
+
+
+def _ncc_at(maps, x, y, pad):
+    """Correlation with the seed template at (x, y), best over a 5 x 5 px
+    neighbourhood. The whole frame map is only filled in around its own peaks
+    (the search runs at half size), so a candidate that came from the circle
+    votes or from the previous frame is correlated here, on demand. Reading the
+    unfilled map instead gave every such candidate a correlation of 0, which
+    is how 3106 lost the bottom of a squat: the plate there was a perfect
+    circle that the template, built against a pale wall, did not rank."""
+    best = 0.0
+    for m in maps:
+        res, t_w = m[0], m[1]
+        cx = int(round(x + pad - t_w.shape[1] / 2)); cy = int(round(y + pad - t_w.shape[0] / 2))
+        x0, y0 = max(0, cx - 2), max(0, cy - 2)
+        x1, y1 = min(res.shape[1], cx + 3), min(res.shape[0], cy + 3)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        if len(m) > 3 and res[y0:y1, x0:x1].min() <= -1.0:
+            gwp = m[3]
+            win = gwp[y0:y1 + t_w.shape[0] - 1, x0:x1 + t_w.shape[1] - 1]
+            if win.shape[0] >= t_w.shape[0] and win.shape[1] >= t_w.shape[1]:
+                r2 = cv2.matchTemplate(win, t_w, cv2.TM_CCOEFF_NORMED)
+                res[y0:y0 + r2.shape[0], x0:x0 + r2.shape[1]] = r2
+        best = max(best, float(res[y0:y1, x0:x1].max()))
+    return best
+
+
+def _circle_v(gx, gy, X, Y, R):
+    """circle_score for many centres at once (None -> nan)."""
+    H, W = gx.shape
+    rr = np.array([0.92, 1.0, 1.08])[None, :, None] * R
+    px = X[:, None, None] + rr * _CA[None, None, :]
+    py = Y[:, None, None] + rr * _SA[None, None, :]
+    ok = (px >= 1) & (px < W - 1) & (py >= 1) & (py < H - 1)
+    xi = np.clip(px, 0, W - 1).astype(np.int32); yi = np.clip(py, 0, H - 1).astype(np.int32)
+    rad = np.abs(gx[yi, xi] * _CA[None, None, :] + gy[yi, xi] * _SA[None, None, :])
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        med = np.nanmedian(np.where(ok, rad, np.nan), axis=2)        # (n, 3)
+        out = np.nanmax(np.where(ok.any(2), med, np.nan), axis=1)
+    out[ok[:, 1, :].sum(1) < N_ANG * 0.5] = np.nan
+    return out
+
+
+def _shape_v(f, X, Y, R):
+    """shape_score for many centres at once."""
+    H, W = f.shape
+    n = len(X)
+    xs = X[:, None, None] + (np.cos(_SA48)[:, None] * (_SR * R)[None, :])[None]
+    ys = Y[:, None, None] + (np.sin(_SA48)[:, None] * (_SR * R)[None, :])[None]
+    ok = (xs.min(2) >= 1) & (ys.min(2) >= 1) & (xs.max(2) <= W - 2) & (ys.max(2) <= H - 2)
+    v = cv2.remap(f, xs.reshape(n * 48, -1).astype(np.float32), ys.reshape(n * 48, -1).astype(np.float32),
+                  cv2.INTER_LINEAR).reshape(n, 48, -1)
+    g = np.abs(np.gradient(v, axis=2))
+    j = np.argmax(g, axis=2)
+    m = np.take_along_axis(g, j[..., None], axis=2)[..., 0]
+    hit = (m > 1.5) & (np.abs(_SR[j] - 1.0) <= 0.12) & ok
+    cnt = ok.sum(1)
+    return np.where(cnt >= 20, hit.sum(1) / np.maximum(cnt, 1), 0.0)
+
+
+def _shape_radii(f, cx, cy, Rs):
+    """shape_score at one centre for many radii, in one remap."""
+    H, W = f.shape
+    nr = len(Rs)
+    rad = Rs[:, None, None] * _SR[None, None, :]                       # (nr, 1, 16)
+    xs = cx + np.cos(_SA48)[None, :, None] * rad                       # (nr, 48, 16)
+    ys = cy + np.sin(_SA48)[None, :, None] * rad
+    ok = (xs.min(2) >= 1) & (ys.min(2) >= 1) & (xs.max(2) <= W - 2) & (ys.max(2) <= H - 2)
+    v = cv2.remap(f, xs.reshape(nr * 48, -1).astype(np.float32), ys.reshape(nr * 48, -1).astype(np.float32),
+                  cv2.INTER_LINEAR).reshape(nr, 48, -1)
+    g = np.abs(np.gradient(v, axis=2))
+    j = np.argmax(g, axis=2)
+    m = np.take_along_axis(g, j[..., None], axis=2)[..., 0]
+    hit = (m > 1.5) & (np.abs(_SR[j] - 1.0) <= 0.12) & ok
+    cnt = ok.sum(1)
+    return np.where(cnt >= 20, hit.sum(1) / np.maximum(cnt, 1), 0.0)
+
+
+def _ring_v(f, X, Y, R):
+    n = len(X)
+    xs = (X[:, None, None] + (np.outer(_RF * R, np.cos(_RA)))[None]).astype(np.float32)
+    ys = (Y[:, None, None] + (np.outer(_RF * R, np.sin(_RA)))[None]).astype(np.float32)
+    v = cv2.remap(f, xs.reshape(n * 6, -1), ys.reshape(n * 6, -1), cv2.INTER_LINEAR,
+                  borderMode=cv2.BORDER_REPLICATE).reshape(n, 6, -1)
+    return np.concatenate([v.mean(2), v.std(2)], axis=1)
+
+
+def _profile_dist_v(P, p0):
+    m, s_ = P[:, :6], P[:, 6:]
+    m0, s0 = p0[:6], p0[6:]
+    dm = np.mean(np.abs((m - m.mean(1, keepdims=True)) - (m0 - m0.mean())), axis=1) / (np.std(m0) + 12.0)
+    dl = np.abs(m.mean(1) - m0.mean()) / (abs(m0.mean()) * 0.5 + 25.0)
+    ds = np.mean(np.abs(s_ - s0), axis=1) / (np.mean(s0) + 8.0)
+    return np.minimum(1.5, 0.5 * dm + 0.3 * dl + 0.4 * ds)
+
+
+def _patch_v(f, X, Y, R):
+    xs = (X[:, None] + (_PX[_PM] * R)[None, :]).astype(np.float32)
+    ys = (Y[:, None] + (_PY[_PM] * R)[None, :]).astype(np.float32)
+    v = cv2.remap(f, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    v = v - v.mean(1, keepdims=True)
+    nrm = np.linalg.norm(v, axis=1, keepdims=True)
+    return np.where(nrm > 1e-6, v / np.maximum(nrm, 1e-6), v).astype(np.float32)
+
+
+def score_frame(gw, cands, R, circ0, prof0=None, fgr=None):
+    """Every candidate of one frame scored at once (one remap per measure),
+    which took the scoring from about 6 ms a frame to under 1."""
+    fb, gx, gy = fgr if fgr is not None else _fgrad(gw)
     f = Frame()
-    xy, ncc, circ, shp, idd = [], [], [], [], []
-    for x, y, s in cands:
-        c = circle_score(gx, gy, x, y, R)
-        cn = 0.0 if c is None else min(1.2, c / max(circ0, 1e-6))
-        xy.append((x, y)); ncc.append(s); circ.append(cn); shp.append(shape_score(fb, x, y, R))
-        idd.append(profile_dist(ring_profile(fb, x, y, R), prof0) if prof0 is not None else 0.0)
-    f.xy = np.array(xy, float).reshape(-1, 2)
-    f.ncc = np.array(ncc, float)
-    f.circ = np.array(circ, float)
-    f.shape = np.array(shp, float)
-    f.id = np.array(idd, float)
-    f.patch = (np.array([patch(fb, x, y, R) for x, y, _s in cands], np.float32)
-               if cands else np.zeros((0, int(_PM.sum())), np.float32))
+    n = len(cands)
+    if n == 0:
+        f.xy = np.zeros((0, 2)); f.ncc = f.circ = f.shape = f.id = f.unary = np.zeros(0)
+        f.patch = np.zeros((0, int(_PM.sum())), np.float32)
+        return f
+    f.xy = np.array([(c[0], c[1]) for c in cands], float)
+    f.ncc = np.array([c[2] for c in cands], float)
+    X, Y = f.xy[:, 0], f.xy[:, 1]
+    c = _circle_v(gx, gy, X, Y, R)
+    f.circ = np.where(np.isnan(c), 0.0, np.minimum(1.2, c / max(circ0, 1e-6)))
+    f.shape = _shape_v(fb, X, Y, R)
+    f.id = _profile_dist_v(_ring_v(fb, X, Y, R), prof0) if prof0 is not None else np.zeros(n)
+    f.patch = _patch_v(fb, X, Y, R)
     f.unary = (W_NCC * (1.0 - np.clip(f.ncc, 0, 1)) + W_CIRC * np.clip(1.0 - f.circ, 0, 1)
                + W_SHAPE * (1.0 - f.shape) + W_ID * f.id)
     return f
@@ -382,41 +522,48 @@ def solve(frames, seed_xy, R, efps, side_free_s=4.0, plate_r_m=PLATE_R_M, seed_p
     c0 = np.full(len(f0.xy), INF); c0[0] = 0.0
     cost[0] = c0; back[0] = np.full((len(f0.xy), 2), -1, int)
     jit = JITTER_R * R
+    # All the frames a step may come from (the last G) are scored in one go:
+    # their live candidates are stacked, nearest frame first, so ties go to the
+    # shortest step exactly as the frame by frame loop this replaces did.
     for t in range(1, T):
         ft = frames[t]
         n = len(ft.xy)
         if n == 0:
             cost[t] = np.zeros(0); back[t] = np.zeros((0, 2), int); continue
-        best = np.full(n, INF); bk = np.full((n, 2), -1, int)
+        XY, CP, PT, KK, PF, PI = [], [], [], [], [], []
         for k in range(1, min(G, t) + 1):
             p = t - k
             cp = cost[p]
             if cp is None or len(cp) == 0:
                 continue
-            live = cp < INF / 2
-            if not live.any():
+            live = np.flatnonzero(cp < INF / 2)
+            if len(live) == 0:
                 continue
-            dt = k / efps
-            side = SIDE_MAX if k == 1 else SIDE_SKIP
-            d = ft.xy[None, :, :] - frames[p].xy[live][:, None, :]      # (m, n, 2)
-            dx = np.abs(d[..., 0]); dy = d[..., 1]                      # +dy is down
-            side_lim = side * dt * ppm if k == 1 else min(side * dt, SIDE_SKIP_M) * ppm
-            ok = ((dx <= side_lim + jit) &
-                  (-dy <= UP_MAX * dt * ppm + jit) &
-                  (dy <= DOWN_MAX * dt * ppm + jit))
-            v = np.hypot(dx, dy) / ppm / dt
-            pc = frames[p].patch[live] @ ft.patch.T                     # (m, n)
-            tr = (0.03 * v * v + (W_DIST * np.abs(dy) + W_SIDE * dx) / ppm + SKIP_COST * (k - 1)
-                  + W_PAIR * np.clip(1.0 - pc, 0.0, 1.5))
-            tot = cp[live][:, None] + tr + ft.unary[None, :]
-            tot = np.where(ok, tot, INF)
-            arg = np.argmin(tot, axis=0)
-            val = tot[arg, np.arange(n)]
-            src = np.flatnonzero(live)[arg]
-            better = val < best
-            best = np.where(better, val, best)
-            bk[better, 0] = p; bk[better, 1] = src[better]
-        cost[t] = best; back[t] = bk
+            XY.append(frames[p].xy[live]); CP.append(cp[live]); PT.append(frames[p].patch[live])
+            KK.append(np.full(len(live), k)); PF.append(np.full(len(live), p)); PI.append(live)
+        if not XY:
+            cost[t] = np.full(n, INF); back[t] = np.full((n, 2), -1, int); continue
+        XY = np.concatenate(XY); CP = np.concatenate(CP); PT = np.concatenate(PT)
+        KK = np.concatenate(KK).astype(float); PF = np.concatenate(PF); PI = np.concatenate(PI)
+        dt = (KK / efps)[:, None]
+        d = ft.xy[None, :, :] - XY[:, None, :]                          # (M, n, 2)
+        dx = np.abs(d[..., 0]); dy = d[..., 1]                          # +dy is down
+        one = (KK == 1)[:, None]
+        side_lim = np.where(one, SIDE_MAX * dt * ppm, np.minimum(SIDE_SKIP * dt, SIDE_SKIP_M) * ppm)
+        ok = ((dx <= side_lim + jit) &
+              (-dy <= UP_MAX * dt * ppm + jit) &
+              (dy <= DOWN_MAX * dt * ppm + jit))
+        v = np.hypot(dx, dy) / ppm / dt
+        pc = PT @ ft.patch.T                                            # (M, n)
+        tr = (0.03 * v * v + (W_DIST * np.abs(dy) + W_SIDE * dx) / ppm
+              + SKIP_COST * (KK[:, None] - 1) + W_PAIR * np.clip(1.0 - pc, 0.0, 1.5))
+        tot = np.where(ok, CP[:, None] + tr + ft.unary[None, :], INF)
+        arg = np.argmin(tot, axis=0)
+        val = tot[arg, np.arange(n)]
+        bk = np.full((n, 2), -1, int)
+        good = val < INF / 2
+        bk[good, 0] = PF[arg[good]]; bk[good, 1] = PI[arg[good]]
+        cost[t] = np.where(good, val, INF); back[t] = bk
     # end anywhere, paying for the frames after it
     endt, endi, endc = 0, 0, cost[0][0] + SKIP_COST * (T - 1)
     for t in range(T):
@@ -468,8 +615,8 @@ def rim_check(GW, path, R, n=24):
     pick = idx[::max(1, len(idx) // n)][:n]
     M = []
     for i in pick:
-        f = _blur(GW[i]) if _GCACHE[0] is GW[i] else cv2.GaussianBlur(GW[i].astype(np.float32), (0, 0), 1.0)
-        M.append([shape_score(f, path[i][0], path[i][1], R * q) for q in RIM_RATIOS])
+        f = _blur(GW[i])
+        M.append(_shape_radii(f, path[i][0], path[i][1], R * RIM_RATIOS))
     med = np.median(np.array(M), axis=0)
     def at(q):
         return float(med[int(np.argmin(np.abs(RIM_RATIOS - q)))])
@@ -491,6 +638,112 @@ def rim_check(GW, path, R, n=24):
             if med[k] >= RIM_INNER and (k == 0 or med[k] >= med[k - 1]) and (k + 1 >= len(med) or med[k] >= med[k + 1]):
                 return float(q), float(med[k]), med
     return 1.0, s1, med
+
+
+MP_Q    = np.round(np.arange(0.40, 3.05, 0.05), 3)   # ring sizes tried, x seed radius
+MP_ANG  = 2 * math.pi * np.arange(72) / 72
+MP_IN   = np.array([0.80, 0.84, 0.88, 0.92])          # just inside a ring, x ring
+MP_OUT  = np.array([1.08, 1.12, 1.16, 1.20])          # just outside it
+MP_RING = 0.55     # shape score, median across frames: a ring is there
+MP_MOVE = 0.50     # fraction of directions where the ring is a motion edge
+MP_N    = 32
+
+
+def _spread(path, idx, n, R):
+    """Frames whose bar positions are as far apart as possible (greedy
+    farthest point). A deadlift spends most of its clip on the floor, so
+    frames evenly spaced in time are mostly the same picture."""
+    P = np.array([[path[i][0], path[i][1]] for i in idx], float)
+    pick = [0]
+    d = np.hypot(P[:, 0] - P[0, 0], P[:, 1] - P[0, 1])
+    while len(pick) < min(n, len(idx)):
+        j = int(np.argmax(d))
+        if d[j] < R * 0.04:
+            break
+        pick.append(j)
+        d = np.minimum(d, np.hypot(P[:, 0] - P[j, 0], P[:, 1] - P[j, 1]))
+    if len(pick) < n:                                  # top up evenly in time
+        for j in np.linspace(0, len(idx) - 1, n).astype(int):
+            if len(pick) >= n:
+                break
+            if j not in pick:
+                pick.append(int(j))
+    return sorted(idx[j] for j in pick)
+
+
+def motion_profile(GW, path, R, n=MP_N):
+    """Which circle around the tracked point is the edge of the thing that
+    MOVES WITH THE BAR?
+
+    Line up the frames on the tracked point. Everything fixed to the bar (the
+    whole plate face, hub, lettering and rim) then stands still from frame to
+    frame, and everything else (the gym behind, which the plate passes in front
+    of) changes. So just inside the rim the picture is the same in every
+    frame, and just outside it is not. Inside a hub, both sides of the hub's
+    edge are plate, so a hub is never a motion edge, however crisp it is; and
+    a circle in the background is background on both sides. That is the
+    question the seed finder cannot answer from five stills: it is how 2919
+    (seeded on a green plate's yellow insert) and 3459 (seeded on a circle
+    reaching into the rack) give themselves away.
+
+    For each ring size q (x R): `ring` is the median shape score across frames
+    (is there a circle edge there), `move` the fraction of directions where
+    the brightness just outside the ring varies across frames much more than
+    just inside it, `cover` the fraction of directions in frame.
+    Returns (MP_Q, ring, move, cover, moved) or None; `moved` is how far the
+    chosen frames spread, in R."""
+    idx = [i for i, p in enumerate(path) if p is not None and i < len(GW)]
+    if len(idx) < 10:
+        return None
+    pick = _spread(path, idx, n, R)
+    P = np.array([[path[i][0], path[i][1]] for i in pick], float)
+    moved = float(np.hypot(P[:, 0] - P[:, 0].mean(), P[:, 1] - P[:, 1].mean()).max() / R)
+    nq = len(MP_Q)
+    rin = (np.outer(MP_Q, MP_IN).ravel() * R)
+    rout = (np.outer(MP_Q, MP_OUT).ravel() * R)
+    ca, sa = np.cos(MP_ANG), np.sin(MP_ANG)
+    SI, SO, SH = [], [], []
+    for i in pick:
+        f = _blur(GW[i]); H, W = f.shape
+        cx, cy = path[i][0], path[i][1]
+        for rr, acc in ((rin, SI), (rout, SO)):
+            X = (cx + np.outer(ca, rr)).astype(np.float32)
+            Y = (cy + np.outer(sa, rr)).astype(np.float32)
+            v = cv2.remap(f, X, Y, cv2.INTER_LINEAR)
+            v[(X < 0) | (Y < 0) | (X > W - 1) | (Y > H - 1)] = np.nan
+            acc.append(v.reshape(len(ca), nq, 4))
+        SH.append(_shape_radii(f, cx, cy, R * MP_Q))
+    SI = np.array(SI); SO = np.array(SO)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        si = np.nanmedian(np.nanstd(SI, 0), -1)            # directions x rings
+        so = np.nanmedian(np.nanstd(SO, 0), -1)
+    valid = (np.sum(~np.isnan(SI[..., 0]), 0) >= 8) & (np.sum(~np.isnan(SO[..., 0]), 0) >= 8)
+    jump = valid & (so > 1.5 * si + 3.0)
+    move = jump.sum(0) / np.maximum(1, valid.sum(0))
+    cover = valid.mean(0)
+    ring = np.median(np.array(SH), 0)
+    return MP_Q, ring, move, cover, moved
+
+
+def motion_rim(prof):
+    """Read motion_profile: the rim is the OUTERMOST ring that is both a circle
+    edge and a motion edge. Returns (q, ring, move) for it, or None."""
+    if prof is None:
+        return None
+    Q, ring, move, cover, moved = prof
+    best = None
+    for i in range(len(Q)):
+        if ring[i] < MP_RING:
+            continue
+        if (i > 0 and ring[i] < ring[i - 1]) or (i + 1 < len(Q) and ring[i] < ring[i + 1]):
+            continue
+        # the jump in what moves can sit one step inside the edge: motion
+        # blur on a fast rep smears the outer rim (2960, original file)
+        mv = max(move[i], move[i - 1]) if i > 0 else move[i]
+        if mv >= MP_MOVE and cover[i] >= 0.5:
+            best = (float(Q[i]), float(ring[i]), float(mv))
+    return best
 
 
 def refine_path(path, GF, tpl_full, fine):
