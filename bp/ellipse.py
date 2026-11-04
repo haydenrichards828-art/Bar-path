@@ -30,25 +30,29 @@ MIN_G = 1.5              # a gradient weaker than this is not a rim
 
 
 def rim_points(gray, cx, cy, r, n_ang=N_ANG):
-    """The radius of the strongest brightness step, one per angle."""
+    """The radius of the strongest brightness step, one per angle. All angles
+    are sampled in one remap (the per angle loop it replaces cost 4 ms a crop,
+    a quarter of a second a clip)."""
     rs = np.linspace(r * BAND[0], r * BAND[1], N_RAD)
+    a = 2 * math.pi * np.arange(n_ang) / n_ang
+    ca, sa = np.cos(a), np.sin(a)
+    xs = cx + np.outer(ca, rs)
+    ys = cy + np.outer(sa, rs)
+    okm = (xs >= 1) & (ys >= 1) & (xs < gray.shape[1] - 1) & (ys < gray.shape[0] - 1)
+    v = cv2.remap(gray, xs.astype(np.float32), ys.astype(np.float32),
+                  cv2.INTER_LINEAR).astype(np.float32)
     pts = []
     for k in range(n_ang):
-        a = 2 * math.pi * k / n_ang
-        ca, sa = math.cos(a), math.sin(a)
-        xs = cx + rs * ca
-        ys = cy + rs * sa
-        ok = (xs >= 1) & (ys >= 1) & (xs < gray.shape[1] - 1) & (ys < gray.shape[0] - 1)
+        ok = okm[k]
         if ok.sum() < 20:
             continue
-        v = cv2.remap(gray, xs[ok].astype(np.float32).reshape(-1, 1),
-                      ys[ok].astype(np.float32).reshape(-1, 1),
-                      cv2.INTER_LINEAR).ravel().astype(np.float32)
-        g = np.abs(np.gradient(v))
+        vv = v[k][ok]
+        g = np.abs(np.gradient(vv))
         j = int(np.argmax(g))
         if g[j] < MIN_G or j <= 1 or j >= len(g) - 2:
             continue        # a peak sitting on the edge of the band is not a rim
-        pts.append((rs[ok][j] * ca, rs[ok][j] * sa, g[j]))
+        rr = rs[ok][j]
+        pts.append((rr * ca[k], rr * sa[k], g[j]))
     return pts
 
 

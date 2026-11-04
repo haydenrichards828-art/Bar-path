@@ -1,0 +1,462 @@
+{
+ "_about": "Hayden's own gym clips, 30 Oct 2026, trimmed to the lift. tap = where a coach would tap, normalised to the upright frame. expect: ok (must measure, verdict ok), ask (check or choose is fine, a silent ok is only fine if every other check passes), refuse (must not answer ok). reps: exact count, null when not gated.",
+ "dl-angled-45deg-far-2718": {
+  "lift": "dl",
+  "tap": [
+   0.71,
+   0.59
+  ],
+  "expect": "ask",
+  "reps": null,
+  "why": "filmed from about 45 degrees and far away: no honest number exists (was refuse: at 45 degrees round the lifter the plate's height and the bar's vertical travel are both intact, so measuring it is fine if the numbers are right; asking is fine too)"
+ },
+ "dl-side-black-close-lowcontrast-2997": {
+  "lift": "dl",
+  "tap": [
+   0.37,
+   0.84
+  ],
+  "expect": "ok",
+  "reps": 1
+ },
+ "dl-side-black-on-red-3004": {
+  "lift": "dl",
+  "tap": [
+   0.4,
+   0.74
+  ],
+  "expect": "ok",
+  "reps": 1
+ },
+ "dl-side-black-on-red-b-3005": {
+  "lift": "dl",
+  "tap": [
+   0.53,
+   0.76
+  ],
+  "expect": "ok",
+  "reps": 1
+ },
+ "dl-side-black-on-red-c-3006": {
+  "lift": "dl",
+  "tap": [
+   0.39,
+   0.8
+  ],
+  "expect": "ok",
+  "reps": 1
+ },
+ "dl-side-black-on-red-d-3007": {
+  "lift": "dl",
+  "tap": [
+   0.49,
+   0.76
+  ],
+  "expect": "ok",
+  "reps": 1,
+  "why": "bumper bounce after the drop must not count as a rep"
+ },
+ "dl-side-bottle-occludes-plate-3052": {
+  "lift": "dl",
+  "tap": [
+   0.5,
+   0.74
+  ],
+  "expect": "ok",
+  "reps": 1
+ },
+ "dl-side-dark-gym-3254": {
+  "lift": "dl",
+  "tap": [
+   0.38,
+   0.77
+  ],
+  "expect": "ok",
+  "reps": 2
+ },
+ "dl-side-fitek-ends-at-lockout-3053": {
+  "lift": "dl",
+  "tap": [
+   0.49,
+   0.74
+  ],
+  "expect": "ok",
+  "reps": 1,
+  "why": "clip ends at lockout; tracker lost the bar on the fast pull"
+ },
+ "dl-side-green-black-mid-2998": {
+  "lift": "dl",
+  "tap": [
+   0.46,
+   0.71
+  ],
+  "expect": "ok",
+  "reps": 1
+ },
+ "dl-side-green-bumper-1rep-2983": {
+  "lift": "dl",
+  "tap": [
+   0.5,
+   0.5
+  ],
+  "expect": "ok",
+  "reps": 1,
+  "why": "tracker jumped to the ceiling at lockout with verdict ok"
+ },
+ "dl-side-iron-starts-mid-rep-2984": {
+  "lift": "dl",
+  "tap": [
+   0.44,
+   0.68
+  ],
+  "expect": "ok",
+  "reps": 1
+ },
+ "dl-side-red-challenge-2reps-2819": {
+  "lift": "dl",
+  "tap": [
+   0.58,
+   0.69
+  ],
+  "expect": "ok",
+  "reps": 2,
+  "why": "bumper bounce after rep 2 was counted as a third rep"
+ },
+ "dl-side-red-challenge-close-3055": {
+  "lift": "dl",
+  "tap": [
+   0.34,
+   0.87
+  ],
+  "expect": "ok",
+  "reps": 1,
+  "why": "seed took the centre hole (r 45) instead of the rim"
+ },
+ "dl-side-red-iron-3003": {
+  "lift": "dl",
+  "tap": [
+   0.46,
+   0.68
+  ],
+  "expect": "ok",
+  "reps": 1
+ },
+ "sq-side-black-blue-hub-close-2960": {
+  "lift": "sq",
+  "tap": [
+   0.5,
+   0.16
+  ],
+  "expect": "ok",
+  "reps": 1,
+  "why": "942x530 source; tracker lost the bar a second in with verdict ok"
+ },
+ "sq-side-yellow-hub-3108": {
+  "lift": "sq",
+  "tap": [
+   0.4,
+   0.24
+  ],
+  "expect": "ok",
+  "reps": 5
+ },
+ "sq-side-yellow-hub-5reps-3104": {
+  "lift": "sq",
+  "tap": [
+   0.24,
+   0.36
+  ],
+  "expect": "ok",
+  "reps": 5,
+  "why": "re-rack at the end must not add to the last rep's range"
+ },
+ "sq-side-yellow-hub-5reps-3106": {
+  "lift": "sq",
+  "tap": [
+   0.31,
+   0.2
+  ],
+  "expect": "ok",
+  "reps": 5
+ },
+ "sq-side-yellow-hub-b-3110": {
+  "lift": "sq",
+  "tap": [
+   0.4,
+   0.23
+  ],
+  "expect": "ok",
+  "reps": 5
+ },
+ "sq-spotter-occlusion-3001": {
+  "lift": "sq",
+  "tap": [
+   0.5,
+   0.33
+  ],
+  "expect": "ask",
+  "reps": 1,
+  "why": "spotter's hands around the bar; seed radius came out 300 for a plate of about 180"
+ },
+ "bench-side-green-plate-2919": {
+  "lift": "bench",
+  "tap": [
+   0.14,
+   0.4
+  ],
+  "expect": "ok",
+  "reps": 9,
+  "why": "side bench, green plate near the left edge, rack upright in front at rest; 9 reps (counted from the v11 trace)"
+ },
+ "bench-side-rogue-foreground-2836": {
+  "lift": "bench",
+  "tap": [
+   0.3,
+   0.45
+  ],
+  "expect": "ok",
+  "reps": 12,
+  "why": "side bench, Rogue plate, spotter behind, red pad in the foreground; 12 reps (counted from the v11 trace: twelve clean dips between unrack and rerack)"
+ },
+ "bench-side-rogue-rack-arm-2835": {
+  "lift": "bench",
+  "tap": [
+   0.26,
+   0.45
+  ],
+  "expect": "ok",
+  "reps": 12,
+  "why": "side bench, lifter sits down first, rack arm and spotter near the plate; 12 reps (counted from the v9 track with a frame at every bottom and top)"
+ },
+ "dl-oblique-iron-2731": {
+  "lift": "dl",
+  "tap": [
+   0.65,
+   0.625
+  ],
+  "expect": "ask",
+  "reps": null,
+  "why": "deadlift filmed about 30 degrees off side, iron plate"
+ },
+ "dl-side-black-yellow-hub-2861": {
+  "lift": "dl",
+  "tap": [
+   0.42,
+   0.555
+  ],
+  "expect": "ok",
+  "reps": 6,
+  "why": "side deadlift, lifter walks in, yellow hub, decoy plates behind"
+ },
+ "dl-side-blue-rogue-close-2943": {
+  "lift": "dl",
+  "tap": [
+   0.41,
+   0.8
+  ],
+  "expect": "ok",
+  "reps": 2,
+  "why": "close side deadlift, big Rogue plate low in frame"
+ },
+ "dl-side-fitek-mid-2856": {
+  "lift": "dl",
+  "tap": [
+   0.58,
+   0.48
+  ],
+  "expect": "ok",
+  "reps": 4,
+  "why": "side deadlift, Fitek plate, mid distance; 4 reps, the bar bounces after the last drop"
+ },
+ "dl-side-green-far-2982": {
+  "lift": "dl",
+  "tap": [
+   0.49,
+   0.535
+  ],
+  "expect": "ok",
+  "reps": 1,
+  "why": "side deadlift, green plate far away (small)"
+ },
+ "dl-side-red-yellow-hub-3reps-2912": {
+  "lift": "dl",
+  "tap": [
+   0.49,
+   0.6
+  ],
+  "expect": "ok",
+  "reps": 12,
+  "why": "side deadlift, 12 reps (counted from the track with a frame at every top; the 3 in the name was wrong)"
+ },
+ "sq-front-oblique-2725": {
+  "lift": "sq",
+  "tap": [
+   0.78,
+   0.3
+  ],
+  "expect": "ask",
+  "reps": null,
+  "why": "squat filmed from the front oblique, plate seen edge on"
+ },
+ "sq-identical-plate-on-rack-3458": {
+  "lift": "sq",
+  "tap": [
+   0.5,
+   0.425
+  ],
+  "expect": "ok",
+  "reps": 3,
+  "why": "side squat, identical plates stored on the rack beside the bar"
+ },
+ "sq-identical-plate-on-rack-b-3459": {
+  "lift": "sq",
+  "tap": [
+   0.71,
+   0.42
+  ],
+  "expect": "ok",
+  "reps": 3,
+  "why": "side squat, identical plates on the rack, person walks behind"
+ },
+ "sq-side-black-2712": {
+  "lift": "sq",
+  "tap": [
+   0.555,
+   0.16
+  ],
+  "expect": "ok",
+  "reps": 4,
+  "why": "side squat, black bumper near the top of frame"
+ },
+ "sq-side-black-close-2710": {
+  "lift": "sq",
+  "tap": [
+   0.19,
+   0.15
+  ],
+  "expect": "ok",
+  "reps": null,
+  "why": "close side squat, walkout, plate near the left edge; about 4 reps (count from a 1.5 Hz sheet, not exact)"
+ },
+ "sq-side-spotter-behind-3395": {
+  "lift": "sq",
+  "tap": [
+   0.32,
+   0.37
+  ],
+  "expect": "ok",
+  "reps": 5,
+  "why": "side squat, spotter standing behind"
+ },
+ "sq-side-yellow-hub-2843": {
+  "lift": "sq",
+  "tap": [
+   0.28,
+   0.315
+  ],
+  "expect": "ok",
+  "reps": 6,
+  "why": "side squat, identical yellow hub plates on the storage rack"
+ },
+ "sq-spotter-close-2708": {
+  "lift": "sq",
+  "tap": [
+   0.6,
+   0.165
+  ],
+  "expect": "ok",
+  "reps": 10,
+  "why": "side squat, spotter steps in close late in the set; 10 reps (1.2 Hz sheet said about 10; the v11 trace shows ten clean dips)"
+ },
+ "dl-side-yellow-hub-long-setups-2857": {
+  "lift": "dl",
+  "tap": [
+   0.58,
+   0.475
+  ],
+  "expect": "ok",
+  "reps": 12,
+  "why": "side deadlift, 12 reps with a reset on the floor between each"
+ },
+ "dl-side-yellow-hub-multi-2858": {
+  "lift": "dl",
+  "tap": [
+   0.535,
+   0.525
+  ],
+  "expect": "ok",
+  "reps": 8,
+  "why": "side deadlift, several reps, starts with lifter stretching"
+ },
+ "dl-side-yellow-hub-multi-b-2860": {
+  "lift": "dl",
+  "tap": [
+   0.39,
+   0.525
+  ],
+  "expect": "ok",
+  "reps": 7,
+  "why": "side deadlift, several reps with rests on the floor"
+ },
+ "_removed": {
+  "bench-plate-cut-left-edge-spotter-2690": {
+   "lift": "bench",
+   "tap": [
+    0.05,
+    0.4
+   ],
+   "expect": "refuse",
+   "reps": null,
+   "why": "near plate cut by the left edge of the frame, spotter"
+  },
+  "sq-plate-cut-top-flare-3023": {
+   "lift": "sq",
+   "tap": [
+    0.36,
+    0.07
+   ],
+   "expect": "refuse",
+   "reps": null,
+   "why": "plate cut by the top of the frame, lens flare; v8 answered ok with the hole as the plate"
+  },
+  "sq-plate-cut-top-flare-b-3025": {
+   "lift": "sq",
+   "tap": [
+    0.32,
+    0.05
+   ],
+   "expect": "refuse",
+   "reps": null
+  },
+  "dl-close-stacked-plate-cut-bottom-3054": {
+   "lift": "dl",
+   "tap": [
+    0.57,
+    0.85
+   ],
+   "expect": "ask",
+   "reps": 1,
+   "why": "camera very close, plate cut by the bottom edge while on the floor"
+  },
+  "dl-failed-pull-no-rep-3056": {
+   "lift": "dl",
+   "tap": [
+    0.49,
+    0.85
+   ],
+   "expect": "refuse",
+   "reps": 0,
+   "why": "plate half out of frame and the bar never leaves the floor"
+  },
+  "sq-oblique-red-plates-on-rack-2724": {
+   "lift": "sq",
+   "tap": [
+    0.04,
+    0.29
+   ],
+   "expect": "ask",
+   "reps": null,
+   "why": "oblique squat, plate cut by the left edge in the first frame, red decoys"
+  }
+ }
+}
