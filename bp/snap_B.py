@@ -55,19 +55,38 @@ def _prep(gray, tap, rmax_guess):
     return w, gx / mag, gy / mag, mag, sc, x0, y0
 
 
-def _polish(score, bx, by, r, sc, x0, y0):
+_O5 = np.arange(-2, 2.01, 1.0)
+_GXY = np.array([(dx, dy) for dx in _O5 for dy in _O5])                  # 25, dx outer
+_GXYR = np.array([(dx, dy, dr) for dx in _O5 for dy in _O5 for dr in _O5])  # 125
+
+
+def _best(vals, base):
+    """Index of the first maximum if it beats `base` strictly, else None: the
+    same answer as scanning the candidates in order and keeping a strict
+    improvement, which is what the loops this replaces did."""
+    i = int(np.argmax(vals))
+    return i if vals[i] > base else None
+
+
+def _joint(score_v, bx, by, r, steps):
+    """Joint centre and radius refinement, all 125 candidates of a step scored
+    in one call (6 Nov 2026: the loops it replaces made the seed take 1.3 s)."""
+    s = float(score_v(np.array([bx]), np.array([by]), np.array([r]))[0])
+    for step in steps:
+        s = float(score_v(np.array([bx]), np.array([by]), np.array([r]))[0])
+        rr = r + _GXYR[:, 2] * step
+        keep = rr >= 8
+        cx = bx + _GXYR[keep, 0] * step; cy = by + _GXYR[keep, 1] * step; rk = rr[keep]
+        v = score_v(cx, cy, rk)
+        i = _best(v, s)
+        if i is not None:
+            bx, by, r, s = float(cx[i]), float(cy[i]), float(rk[i]), float(v[i])
+    return bx, by, r, s
+
+
+def _polish(score_v, bx, by, r, sc, x0, y0):
     """Joint centre+radius refinement only, used when the radius is given."""
-    for step in (r * 0.04, r * 0.015, r * 0.006):
-        cand = (bx, by, r, score(bx, by, r))
-        for dx in np.arange(-2, 2.01, 1.0):
-            for dy in np.arange(-2, 2.01, 1.0):
-                for dr in np.arange(-2, 2.01, 1.0):
-                    rr = r + dr * step
-                    if rr < 8: continue
-                    v = score(bx + dx * step, by + dy * step, rr)
-                    if v > cand[3]:
-                        cand = (bx + dx * step, by + dy * step, rr, v)
-        bx, by, r, s = cand
+    bx, by, r, s = _joint(score_v, bx, by, r, (r * 0.04, r * 0.015, r * 0.006))
     return (bx / sc + x0, by / sc + y0, r / sc, s)
 
 
@@ -143,28 +162,34 @@ def _snap1(gray, tap, hint_r=None, n_ang=96, lock=False):
     ang = np.linspace(0, 2 * math.pi, n_ang, endpoint=False)
     ca, sa = np.cos(ang), np.sin(ang)
 
-    def score(cx, cy, r):
-        px = cx + r * ca; py = cy + r * sa
+    def score_v(cx, cy, r):
+        """Many circles at once: cx, cy, r arrays of the same length."""
+        px = cx[:, None] + r[:, None] * ca[None, :]; py = cy[:, None] + r[:, None] * sa[None, :]
         ok = (px >= 1) & (px < Ws - 1) & (py >= 1) & (py < Hs - 1)
-        if ok.sum() < n_ang * 0.5:
-            return -1.0
-        xi = px[ok].astype(np.int32); yi = py[ok].astype(np.int32)
-        rad = np.abs(ux[yi, xi] * ca[ok] + uy[yi, xi] * sa[ok]) * mag[yi, xi]
+        xi = np.where(ok, px, 1).astype(np.int32); yi = np.where(ok, py, 1).astype(np.int32)
+        rad = np.abs(ux[yi, xi] * ca[None, :] + uy[yi, xi] * sa[None, :]) * mag[yi, xi]
         # median, not mean: a lifter's body occluding a third of the rim should
         # not be able to veto the right circle
-        return float(np.median(rad))
+        rad = np.where(ok, rad, np.nan)
+        cnt = ok.sum(1)
+        out = np.full(len(cx), -1.0)
+        good = cnt >= n_ang * 0.5
+        if good.any():
+            out[good] = np.nanmedian(rad[good], axis=1)
+        return out
 
     cx0, cy0 = (tap[0] - x0) * sc, (tap[1] - y0) * sc
     radii = np.geomspace(rlo * sc, rhi * sc, 44)
+    st_ = np.maximum(1.0, radii * 0.09)
+    CX = cx0 + _GXY[None, :, 0] * st_[:, None]; CY = cy0 + _GXY[None, :, 1] * st_[:, None]
+    V = score_v(CX.ravel(), CY.ravel(), np.repeat(radii, len(_GXY))).reshape(len(radii), len(_GXY))
     prof = []
-    for r in radii:
-        st = max(1.0, r * 0.09)
-        best = -1.0; bc = (cx0, cy0)
-        for dx in (-2, -1, 0, 1, 2):
-            for dy in (-2, -1, 0, 1, 2):
-                s = score(cx0 + dx * st, cy0 + dy * st, r)
-                if s > best: best, bc = s, (cx0 + dx * st, cy0 + dy * st)
-        prof.append((r, best, bc))
+    for k, r in enumerate(radii):
+        i = _best(V[k], -1.0)
+        if i is None:
+            prof.append((r, -1.0, (cx0, cy0)))
+        else:
+            prof.append((r, float(V[k, i]), (float(CX[k, i]), float(CY[k, i]))))
 
     top = max(p[1] for p in prof)
     if top <= 0:
@@ -175,12 +200,11 @@ def _snap1(gray, tap, hint_r=None, n_ang=96, lock=False):
     # rim. Everything concentric with the hub belongs to the same plate, so a
     # much lower bar is safe here than in the open search above.
     for step in (r * 0.05, r * 0.02):
-        cand = (bx, by, r, s)
-        for dx in np.arange(-2, 2.01, 1.0):
-            for dy in np.arange(-2, 2.01, 1.0):
-                v = score(bx + dx * step, by + dy * step, r)
-                if v > cand[3]: cand = (bx + dx * step, by + dy * step, r, v)
-        bx, by, r, s = cand
+        cx = bx + _GXY[:, 0] * step; cy = by + _GXY[:, 1] * step
+        v = score_v(cx, cy, np.full(len(cx), r))
+        i = _best(v, s)
+        if i is not None:
+            bx, by, s = float(cx[i]), float(cy[i]), float(v[i])
 
     # FIX 2 (6 Sep, real-footage set): the outward sweep used to run all the way
     # to rhi. In a gym the background is full of plates, racks and mirrors, so
@@ -189,12 +213,13 @@ def _snap1(gray, tap, hint_r=None, n_ang=96, lock=False):
     # bench clips ran away to r=463 and r=375 from true plates of 107 and 113.
     # A plate's rim is at most about 3-4x its hub, so cap the sweep.
     if lock:
-        return _polish(score, bx, by, r, sc, x0, y0)
+        return _polish(score_v, bx, by, r, sc, x0, y0)
     if _hubness(gray, bx / sc + x0, by / sc + y0, r / sc) <= HUB_DARK:
-        return _polish(score, bx, by, r, sc, x0, y0)   # already the rim
+        return _polish(score_v, bx, by, r, sc, x0, y0)   # already the rim
 
     rs = np.geomspace(r, min(rhi * sc, r * OUT_MAX), 40)
-    prof2 = [(rr, score(bx, by, rr)) for rr in rs]
+    pv = score_v(np.full(len(rs), bx), np.full(len(rs), by), rs)
+    prof2 = [(rr, float(v)) for rr, v in zip(rs, pv)]
     base = max(p[1] for p in prof2)
     outer = r
     for i in range(1, len(prof2) - 1):
@@ -204,17 +229,7 @@ def _snap1(gray, tap, hint_r=None, n_ang=96, lock=False):
     r = outer
 
     # final joint refinement of centre and radius
-    for step in (r * 0.04, r * 0.015, r * 0.006):
-        cand = (bx, by, r, score(bx, by, r))
-        for dx in np.arange(-2, 2.01, 1.0):
-            for dy in np.arange(-2, 2.01, 1.0):
-                for dr in np.arange(-2, 2.01, 1.0):
-                    rr = r + dr * step
-                    if rr < 8: continue
-                    v = score(bx + dx * step, by + dy * step, rr)
-                    if v > cand[3]:
-                        cand = (bx + dx * step, by + dy * step, rr, v)
-        bx, by, r, s = cand
+    bx, by, r, s = _joint(score_v, bx, by, r, (r * 0.04, r * 0.015, r * 0.006))
     return (bx / sc + x0, by / sc + y0, r / sc, s)
 
 

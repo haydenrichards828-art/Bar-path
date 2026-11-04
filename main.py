@@ -49,7 +49,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from bp.pipeline import analyse, STEP, PLATE_MM
 
-app = FastAPI(title="ForceTrack Bar Path API", version="9.0.0")
+app = FastAPI(title="ForceTrack Bar Path API", version="10.0.0")
 ALLOWED_ORIGINS = [
     "https://forgedfitnesspt.netlify.app",
     "http://localhost:3000",   # vite dev
@@ -388,6 +388,8 @@ async def _emit_inner(work, rot, tap_norm, seed_hint, token, seed_imgs=None,
         # the plate finder's own verdict before the track confirmed or doubted it
         "doubts": r.get("doubts") or [],
         "seed_verdict": r.get("seed_verdict"),
+        # v10: tracked again from a better circle (why, and which pass was kept)
+        "second_look": r.get("second_look"),
         "plate_mm": r.get("plate_mm"),
         "off_square_deg": r.get("off_square_deg"),
         "scale_model": r.get("scale_model"),

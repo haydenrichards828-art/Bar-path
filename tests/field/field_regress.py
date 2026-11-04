@@ -28,7 +28,7 @@ A clip passes only if every check below holds. Exit code is the number failing.
             expect "refuse" -> refuse, check or choose (never a silent ok)
   reps      exact count, when expectations give one (no missed, no ghost reps)
   jumps     no step between consecutive path points that the bar cannot make:
-            up faster than 2.5 m/s, sideways faster than 1.0 m/s, or down
+            up faster than 2.5 m/s, sideways faster than 1.2 m/s, or down
             faster than a 0.8 m free fall (the tracker leaving the plate)
   rom       every rep marked measured is inside the lift's plausible range
   mcv       mean concentric velocity of every measured rep is 0.05 to 1.6 m/s
@@ -201,7 +201,10 @@ def check(stem, exp, r):
             vx = abs(b["x"] - a["x"]) * W / ppm / dt
             vy = (b["y"] - a["y"]) * H / ppm / dt          # + is down
             worst = max(worst, math.hypot(vx, vy))
-            if vx > 1.0 or -vy > 2.5 or vy > 4.0:
+            # sideways 1.2 m/s, the tracker's own SIDE_MAX. Was 1.0: racking a
+            # bench (2919, 2836, original files) peaks at 1.0 to 1.05 m/s over
+            # one 1/15 s step, checked frame by frame with the plate centred.
+            if vx > 1.2 or -vy > 2.5 or vy > 4.0:
                 jumped = True
     # reps
     nrep = len(reps)

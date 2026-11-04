@@ -1,5 +1,20 @@
 """ForceTrack bar path: the whole analysis, end to end.
 
+v10 (Nov 2026): the clip itself now says which circle is the plate. Line the
+frames up on the tracked point and the plate face stands still while the gym
+behind it moves, so the plate's rim is the outermost circle that is both an
+edge and the boundary of what moves with the bar (dp.motion_profile). A hub is
+never that boundary, nor is a circle in the background. "ok" now needs that
+confirmation. When the first track's circle turns out to be the wrong one
+(a hub, a circle reaching into the rack, a circle that never moved), analyse()
+tracks again from a better one, reusing the decoded frames, and keeps the pass
+the clip confirms. A tap the two plate finders would refuse gets a third
+finder (ringfind: whole circles containing the tap, partly out of shot
+allowed) before it is refused. Template correlation is computed for every
+candidate (it was read off a map filled only around its own peaks, so circle
+candidates scored 0 and 3106 lost the bottom of a squat), and a gap of 0.8 s
+mid set is a doubt, because a rep fits in it.
+
 v9 (Nov 2026): the tracker is bp/dp.py (every frame's candidates scored for
 plate evidence, one physically possible path for the whole clip), the seed
 circle is checked against the whole path (bp/dp.rim_check), reps are counted
@@ -43,6 +58,7 @@ import v7
 import dp as _dp
 import snap as _snap
 import ellipse as _el
+import ringfind as _rf
 from plate import find_plate
 
 SEED_N      = 11       # consecutive full-res frames the plate finder gets
@@ -66,8 +82,14 @@ VEL_WINDOW_S= 0.05     # velocity is measured over this window, not frame to fra
 QUAD        = True     # parabolic resample (False = the old straight line)
 TRACKER     = "dp"     # "dp" (v9, whole clip path with plate evidence) or "v8"
 WORK_MAX    = 480      # px, longest side of a working frame
+N_WORKERS   = max(2, min(6, (__import__("os").cpu_count() or 2)))
 HUB_ASK     = 15.0     # seed interior this much brighter than its surround: a hub
 MCV_MAX     = 1.3      # m/s mean concentric; faster is the tracker, not the lifter
+MR_LO, MR_HI = 0.88, 1.15  # a motion rim this close to the seed's size IS the seed's ring
+RF_HIT_REFUSED = 0.65  # the same, when the alternative is refusing the clip
+RF_HIT      = 0.75     # ringfind: fraction of in-frame rays on the circle to offer it
+MAX_LOOKS   = 2        # extra tracking passes from a better circle, at most
+GAP_ASK     = 0.8      # s; the bar lost this long mid set could hide a rep
 
 
 # ---------------------------------------------------------------- decoding
@@ -250,6 +272,105 @@ def _size_curve(ys, hs, base, bins=4):
 def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=None,
             on_point=None, on_stage=None, timeout=180.0, rot=0, tap_norm=None,
             seed_images=None, scale_images=None, plate_mm=PLATE_MM):
+    """See _analyse_once. This adds the second look: when the first track says
+    its own circle was the wrong one (dp.motion_profile found the edge of the
+    moving plate somewhere else, or found nothing and the plate finder had a
+    second circle), track once more from the better circle, reusing the frames
+    already decoded, and keep whichever pass the clip itself confirms."""
+    kw = dict(tap=tap, step=step, width=width, radius_px=radius_px, seed_hint=seed_hint,
+              on_stage=on_stage, timeout=timeout, rot=rot, tap_norm=tap_norm,
+              seed_images=seed_images, scale_images=scale_images, plate_mm=plate_mm)
+    t0 = time.time()
+    tape = []
+    r1 = _analyse_once(path, on_point=on_point, _tape_out=tape, **kw)
+    still = r1.pop("_still", None)
+    first = r1.pop("_retry", None)
+    if TRACKER != "dp" or not r1.get("ok") or seed_hint is not None or radius_px is not None:
+        return r1
+    best, looks = r1, []
+    tried = [r1.get("seed")]
+    todo = [first] if first else []
+    rings_done = False
+
+    def confirmed(r):
+        """The pass's circle is the moving plate's edge: its own ring, or a
+        ring the pass already rescaled to and then confirmed as "ok"."""
+        m = (r.get("track") or {}).get("motion_rim")
+        return bool(m) and (MR_LO <= m[0] <= MR_HI or r.get("verdict") == "ok")
+
+    def near(h):
+        for t in tried:
+            if t and math.hypot(h["cx"] - t["cx"], h["cy"] - t["cy"]) < 0.2 * t["r"] \
+                    and abs(h["r"] - t["r"]) < 0.12 * t["r"]:
+                return True
+        return False
+
+    while len(looks) < MAX_LOOKS:
+        if not todo:
+            if confirmed(best) or rings_done or still is None:
+                break
+            # nothing else to try from the first look: whole circles at the tap
+            rings_done = True
+            tap_px = tap or ((tap_norm or (0.5, 0.5))[0] * still.shape[1],
+                             (tap_norm or (0.5, 0.5))[1] * still.shape[0])
+            try:
+                rc = [c for c in _rf.candidates(still, tap_px) if c["hit"] >= RF_HIT and c["cover"] >= 0.5]
+            except Exception:
+                rc = []
+            rc.sort(key=lambda c: -c["hit"])
+            todo = [{"why": "a whole circle at the tap", "hint": {"cx": c["cx"], "cy": c["cy"], "r": c["r"]}}
+                    for c in rc]
+            continue
+        retry = todo.pop(0)
+        h = dict(retry["hint"])
+        if retry.get("refine") and still is not None:
+            # the size came from a coarse ring search; settle it on the still
+            try:
+                cx, cy, rr, sco = _snap.snap(still, (h["cx"], h["cy"]), h["r"], lock=True)
+                if 0.85 * h["r"] <= rr <= 1.25 * h["r"] and math.hypot(cx - h["cx"], cy - h["cy"]) < 0.3 * h["r"]:
+                    h = {"cx": cx, "cy": cy, "r": rr}
+            except Exception:
+                pass
+        if near(h):
+            continue
+        tried.append(h)
+        kw2 = dict(kw); kw2["seed_hint"] = h; kw2["radius_px"] = None
+        try:
+            r2 = _analyse_once(path, on_point=None, _tape_in=tape, _look=len(looks) + 1, **kw2)
+        except Exception:
+            break
+        looks.append(retry["why"])
+        r2.pop("_still", None)
+        nxt = r2.pop("_retry", None)
+        if nxt:
+            todo.insert(0, nxt)
+        t2 = r2.get("track") or {}
+        if not r2.get("ok") or not t2.get("motion_rim"):
+            continue
+        if not r2.get("doubts") and confirmed_by_track(t2, r2.get("rep_metrics") or []):
+            r2["verdict"] = "ok"
+        else:
+            r2["verdict"] = "check"
+        r2["seed_verdict"] = r1.get("seed_verdict", r1.get("verdict"))
+        r2["alternate"] = r1.get("alternate")
+        r2["first_seed"] = r1.get("seed")
+        r2["t_seed"] = r1.get("t_seed", 0.0)
+        if (confirmed(r2) and not (best.get("verdict") == "ok" and r2["verdict"] != "ok")) \
+                or not confirmed(best):
+            best = r2
+        if confirmed(r2) and r2["verdict"] == "ok":
+            break
+    tape.clear()
+    if looks:
+        best["second_look"] = {"why": looks, "kept": "first" if best is r1 else "later"}
+        best["seconds"] = time.time() - t0
+    return best
+
+
+def _analyse_once(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=None,
+                  on_point=None, on_stage=None, timeout=180.0, rot=0, tap_norm=None,
+                  seed_images=None, scale_images=None, plate_mm=PLATE_MM,
+                  _tape_out=None, _tape_in=None, _look=0):
     """tap: (x, y) in SOURCE pixels, where the coach tapped the plate.
     radius_px: source pixels, when the coach has already sized the circle —
                skips the search entirely.
@@ -260,11 +381,17 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
     mean the seed can be trusted without asking the coach."""
     t_all = time.time()
     plate_r_m = float(plate_mm) / 2000.0
-    q = queue.Queue(maxsize=96)
     stop = threading.Event()
-    threading.Thread(target=_decode_into,
-                     args=(path, q, step, width, stop, SEED_N, rot, SCALE_EVERY),
-                     daemon=True).start()
+    if _tape_in is not None:
+        # second look: replay what the decoder produced the first time
+        q = queue.Queue()
+        for m_ in _tape_in:
+            q.put(m_)
+    else:
+        q = queue.Queue(maxsize=96)
+        threading.Thread(target=_decode_into,
+                         args=(path, q, step, width, stop, SEED_N, rot, SCALE_EVERY),
+                         daemon=True).start()
     stage = on_stage or (lambda *a: None)
 
     fps = 30.0; sc = None; src_n = 0; err = None; src_total = 0
@@ -281,6 +408,8 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
         if done:
             return False
         m = q.get(timeout=timeout)
+        if _tape_out is not None:
+            _tape_out.append(m)
         k = m[0]
         if k == "f":
             sc = m[3]; small.append(m[2])
@@ -369,7 +498,26 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
         if a:
             alt = {"cx": float(a["cx"]), "cy": float(a["cy"]), "r": float(a["r"]),
                    "score": float(a.get("score", 0.0))}
+        if verdict == "refuse" and TRACKER == "dp":
+            # Neither estimator would stand behind a circle. Before refusing,
+            # look for whole circles containing the tap (ringfind), which is
+            # how a plate seen from below with the tap on its sleeve end
+            # (2708), or one partly out of shot, is still found. Whatever it
+            # finds is only provisional: the clip must then show it to be the
+            # edge of the thing moving with the bar before anyone sees "ok".
+            try:
+                rc = [c for c in _rf.candidates(big[0], (float(tap[0]), float(tap[1])))
+                      if c["hit"] >= RF_HIT_REFUSED and c["cover"] >= 0.5]
+            except Exception:
+                rc = []
+            if rc:
+                c = max(rc, key=lambda c: c["hit"] * min(1.0, c["cover"] / 0.8))
+                seed = {"cx": c["cx"] * sc, "cy": c["cy"] * sc, "r": c["r"] * sc,
+                        "score": round(100.0 * c["hit"], 1)}
+                verdict = "check"
+                alt = None
     t_seed = time.time() - t0
+    still = big[0] if big else None
     # is the seed circle brighter inside than just outside it? That is a hub
     # (a chrome boss or a coloured insert in a dark plate), not a plate's rim.
     # Measured on the 47 field clips: the hubs read +10 to +40, real rims -80
@@ -454,42 +602,75 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
         c0 = _dp.crop(GW[0], seed_w[0], seed_w[1], Rw)
         carry = [(seed_w[0], seed_w[1], c0)] if c0 is not None else []
         near_rad = max(cap_px * 2.0, Rw * 0.6)
-        for k, (gw, gf) in enumerate(chain()):
-            cands = _dp.candidates(gw, gf, tf, Rw, fine, near=last, near_rad=near_rad,
-                                   carry=carry)
-            fr_ = _dp.score_frame(gw, cands, Rw, circ0, prof0)
-            DF.append(fr_)
-            carry = []
-            for j_ in np.argsort(fr_.unary)[:_dp.N_CARRY]:
-                cc = _dp.crop(gw, fr_.xy[j_, 0], fr_.xy[j_, 1], Rw)
-                if cc is not None:
-                    carry.append((fr_.xy[j_, 0], fr_.xy[j_, 1], cc))
-            # a provisional point for the live drawing: the best candidate a
-            # barbell could have reached. The answer itself comes from solve().
-            pick = None
-            if len(fr_.xy):
-                dd = np.hypot(fr_.xy[:, 0] - last[0], fr_.xy[:, 1] - last[1])
-                okk = dd <= near_rad
-                if okk.any():
-                    j = int(np.argmin(np.where(okk, fr_.unary, 1e9)))
-                    pick = (float(fr_.xy[j, 0]), float(fr_.xy[j, 1]))
-                    last = pick
-            if on_point:
-                on_point(k, None if pick is None else pick[0] / tsc / sc,
-                         None if pick is None else pick[1] / tsc / sc,
-                         0.0 if pick is None else float(fr_.ncc[j]))
+        # The work for a frame that does not depend on the frame before it
+        # (gradient, whole frame template peaks, circle votes) runs on a pool
+        # of threads a few frames ahead of the sequential part (following the
+        # previous frame's candidates forward, scoring). OpenCV releases the
+        # interpreter lock, so this uses every core Railway gives us.
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(max_workers=N_WORKERS)
+        ahead = deque()
+        src = chain()
+        k = 0
+        try:
+            while True:
+                while len(ahead) < N_WORKERS * 3:
+                    nxt = next(src, None)
+                    if nxt is None:
+                        break
+                    ahead.append(pool.submit(_dp.prepare, nxt[0], nxt[1], tf, Rw))
+                if not ahead:
+                    break
+                ctx = ahead.popleft().result()
+                fr_ = _dp.finish(ctx, Rw, circ0, prof0, carry=carry, carry_rad=near_rad)
+                DF.append(fr_)
+                gw = ctx.gw
+                carry = []
+                for j_ in np.argsort(fr_.unary)[:_dp.N_CARRY]:
+                    cc = _dp.crop(gw, fr_.xy[j_, 0], fr_.xy[j_, 1], Rw)
+                    if cc is not None:
+                        carry.append((fr_.xy[j_, 0], fr_.xy[j_, 1], cc))
+                # a provisional point for the live drawing: the best candidate a
+                # barbell could have reached. The answer itself comes from solve().
+                pick = None
+                if len(fr_.xy):
+                    dd = np.hypot(fr_.xy[:, 0] - last[0], fr_.xy[:, 1] - last[1])
+                    okk = dd <= near_rad
+                    if okk.any():
+                        j = int(np.argmin(np.where(okk, fr_.unary, 1e9)))
+                        pick = (float(fr_.xy[j, 0]), float(fr_.xy[j, 1]))
+                        last = pick
+                if on_point:
+                    on_point(k, None if pick is None else pick[0] / tsc / sc,
+                             None if pick is None else pick[1] / tsc / sc,
+                             0.0 if pick is None else float(fr_.ncc[j]))
+                k += 1
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
         t_fwd = time.time() - t0
         stage("forward", t_fwd, len(DF))
         t0 = time.time()
         dpath = _dp.solve(DF, seed_w, Rw, efps, seed_patch=seed_patch)
         dpath = _dp.refine_path(dpath, GF, tf, fine)
+        # is the seed circle the rim? asked of the whole path now it is known
+        rim_ratio, rim_score, _prof = _dp.rim_check(GW, dpath, Rw)
+        mprof = _dp.motion_profile(GW, dpath, Rw)
+        mrim = _dp.motion_rim(mprof)
+        resolved = False
+        if mrim is not None:
+            q = mrim[0]
+            if MR_LO <= q <= MR_HI:
+                # the circle that moves with the bar is the seed's own: the
+                # ring a static shape check might prefer is not the plate's
+                rim_ratio = 1.0
+            else:
+                rim_ratio = q
         merged = [None if p is None else (p[0], p[1]) for p in dpath]
         conf = [0.0 if p is None else p[2] for p in dpath]
         circ = [None if p is None else p[3] for p in dpath]
         pts = [None if p is None else (p[0] / tsc, p[1] / tsc) for p in merged]
         out, gaps = _dp.bridge(pts, v7.BRIDGE_MAX)
-        # is the seed circle the rim? asked of the whole path now it is known
-        rim_ratio, rim_score, _prof = _dp.rim_check(GW, dpath, Rw)
         if rim_ratio != 1.0:
             R = R * rim_ratio
             seed["r"] = R
@@ -502,6 +683,14 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
         vis = [p for p in dpath if p is not None]
         path_info = {"visited": len(vis), "frames": len(dpath),
                      "rim_ratio": rim_ratio, "rim_score": rim_score,
+                     "rim_profile": None if _prof is None else
+                         [[round(float(q), 2), round(float(v), 2)] for q, v in zip(_dp.RIM_RATIOS, _prof)],
+                     "motion_rim": mrim, "resolved": resolved,
+                     "gaps_s": _gaps_s(gaps, dpath, efps),
+                     "motion_profile": None if mprof is None else
+                         [[round(float(q), 2), round(float(a), 2), round(float(b), 2), round(float(c), 2)]
+                          for q, a, b, c in zip(*mprof[:4])],
+                     "motion_spread": None if mprof is None else round(mprof[4], 2),
                      "ncc_med": float(np.median([p[2] for p in vis])) if vis else 0.0,
                      "circ_med": float(np.median([p[3] for p in vis])) if vis else 0.0,
                      "circ_low": float(np.mean([p[3] < 0.45 for p in vis])) if vis else 1.0,
@@ -750,10 +939,16 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
     #      finder's alone, so a path that left the plate still answered "ok".
     doubts = track_doubts(fr_src, rep_metrics, ppm_src, path_info,
                           src_w, src_h, W_ if fr_src else 1.0, H_ if fr_src else 1.0)
-    if seed_hub >= HUB_ASK and (path_info or {}).get("rim_ratio", 1.0) == 1.0:
+    motion_ok = bool((path_info or {}).get("motion_rim"))
+    if (seed_hub >= HUB_ASK and (path_info or {}).get("rim_ratio", 1.0) == 1.0
+            and not motion_ok):
         doubts.append("the circle looks like the plate's hub, not its rim, and the "
                       "rim could not be found (cut off by the frame?)")
     seed_verdict = verdict
+    if TRACKER == "dp" and not motion_ok and verdict == "ok":
+        # Five stills agreed on a circle, but the clip did not show it to be
+        # the edge of the thing moving with the bar. Not wrong, not proven.
+        doubts.append("the plate's edge could not be confirmed from the bar's movement")
     if doubts and verdict in ("ok", "given"):
         verdict = "check"
     elif not doubts and verdict in ("check", "choose") and confirmed_by_track(path_info, rep_metrics):
@@ -766,9 +961,34 @@ def analyse(path, tap=None, step=STEP, width=WIDTH, radius_px=None, seed_hint=No
         verdict = "ok"
 
     stop.set()
+    # ---- a second look, from a better circle? (analyse() decides)
+    retry = None
+    if TRACKER == "dp" and path_info is not None and (
+            (_look == 0 and seed_hint is None and radius_px is None) or 1 <= _look < MAX_LOOKS):
+        m_ = path_info.get("motion_rim")
+        p0 = next((p for p in dpath if p is not None), None)
+        if m_ is not None and m_[0] < MR_LO and p0 is not None:
+            # the edge of the moving plate is well inside the seed circle: the
+            # template carried the background with it (3459 reached into the
+            # rack and stayed there while the lifter walked out)
+            retry = {"why": "seed circle larger than the moving plate", "refine": True,
+                     "hint": {"cx": p0[0] / tsc / sc, "cy": p0[1] / tsc / sc,
+                              "r": float(seed["r"]) / sc}}
+        elif m_ is not None and m_[0] > MR_HI and doubts and p0 is not None:
+            # The seed was an inner ring (a hub, an insert). Its path is right
+            # wherever the hub was found, but the template was the hub and
+            # every speed limit was judged against a plate that small, so the
+            # path lost whatever the bar did faster: 2919 lost the bottom of
+            # every bench rep. Track again with the plate's own size.
+            retry = {"why": "seed circle was the plate's hub", "refine": True,
+                     "hint": {"cx": p0[0] / tsc / sc, "cy": p0[1] / tsc / sc,
+                              "r": float(seed["r"]) / sc}}
+        elif m_ is None and alt is not None and verdict in ("choose", "check"):
+            retry = {"why": "the first circle's edge did not move with the bar",
+                     "hint": {"cx": alt["cx"], "cy": alt["cy"], "r": alt["r"]}}
     total = time.time() - t_all
     vid_s = src_n / fps if src_n else len(GW) * step / fps
-    return {"ok": True, "frames_src": fr_src, "rep_metrics": rep_metrics,
+    return {"ok": True, "_retry": retry, "_still": still, "frames_src": fr_src, "rep_metrics": rep_metrics,
             "src_w": src_w, "src_h": src_h, "src_frames": n_src,
             "src_total": src_total, "src_fps": fps, "verdict": verdict, "alternate": alt,
             "seed_verdict": seed_verdict, "doubts": doubts, "track": path_info,
@@ -913,10 +1133,41 @@ def drop_bounces(reps, mY, tv):
     return [r for r in reps if r["rom_m"] >= 0.5 * big]
 
 
+def _gaps_s(gaps, path, efps):
+    """[start s, length s, interior] for each stretch the path did not visit
+    (bridged or not). Interior means visited frames on both sides."""
+    vis = [i for i, p in enumerate(path) if p is not None]
+    if not vis:
+        return []
+    first, last = vis[0], vis[-1]
+    out = []
+    i = 0
+    while i < len(path):
+        if path[i] is None:
+            j = i
+            while j < len(path) and path[j] is None:
+                j += 1
+            out.append([round(i / efps, 2), round((j - i) / efps, 2), bool(i > first and j <= last)])
+            i = j
+        else:
+            i += 1
+    return out
+
+
 def confirmed_by_track(info, reps):
+    """The plate finder was unsure from five stills; has the whole clip
+    settled it? Only if the circle the path carries is the edge of the thing
+    moving with the bar (dp.motion_profile), the path stays on it for the set,
+    and every rep measures to a sane range. A circle whose size the motion
+    check had to correct must pass a higher bar."""
     if not info or not reps:
         return False
-    if info.get("rim_ratio", 1.0) != 1.0 or (info.get("rim_score") or 0) < 0.70:
+    m = info.get("motion_rim")
+    if not m:
+        return False
+    q, ring, move = m
+    moved = not (MR_LO <= q <= MR_HI)
+    if ring < (0.60 if moved else _dp.MP_RING) or move < (0.60 if moved else _dp.MP_MOVE):
         return False
     if info.get("frames") and info["visited"] < 0.85 * info["frames"]:
         return False
@@ -937,6 +1188,11 @@ def track_doubts(fr_src, reps, ppm, info, src_w, src_h, W_, H_):
                        % round(100 * (1 - info["visited"] / info["frames"])))
         if info.get("shape_low", 0) > 0.35:
             out.append("much of the path is not on a round plate")
+        lost = [g for g in info.get("gaps_s") or [] if g[2] and g[1] >= GAP_ASK]
+        if lost:
+            g = max(lost, key=lambda g: g[1])
+            out.append("the bar was lost for %.1f s at %.1f s, long enough to hide a rep"
+                       % (g[1], g[0]))
     # physically impossible steps between consecutive points
     if ppm and len(fr_src) > 2:
         x = np.array([p["x"] for p in fr_src]) * W_ / ppm
