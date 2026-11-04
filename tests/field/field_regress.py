@@ -62,15 +62,24 @@ def rotation_of(path):
     return 0
 
 
-def shrink_720(src, work, kbps=2500):
+def shrink_720(src, work, kbps=2500, fps=0):
     """T-9300's phone shrink (src/lib/video-shrink.ts) before the set video is
     uploaded: short edge 720, H.264 at 2.5 Mbps, every frame kept. What is in
-    R2, and therefore what the bar path analyser starts from, is this file."""
+    R2, and therefore what the bar path analyser starts from, is this file.
+
+    fps caps it (T-9396, D58): a frame is kept only when the last one kept is
+    at least 1/fps old, less half a millisecond for rounding, and keeps its own
+    timestamp. The same rule as the app's media-settings.ts and the worker's
+    shrink.mjs. A clip already at or under the cap loses nothing."""
     stem = os.path.splitext(os.path.basename(src))[0]
-    out = os.path.join(work, stem + (".r2.mp4" if kbps == 2500 else f".r2-{kbps}k.mp4"))
+    tag = (f"-{kbps}k" if kbps != 2500 else "") + (f"-{fps}fps" if fps else "")
+    out = os.path.join(work, stem + (f".r2{tag}.mp4"))
     if not os.path.exists(out):
+        keep = f"select='isnan(prev_selected_t)+gte(t-prev_selected_t,{1 / fps - 0.0005:.5f})'," if fps else ""
+        mode = ["-fps_mode", "passthrough"] if fps else []
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", src,
-                        "-vf", "scale=w='if(gt(iw,ih),-2,min(720,iw))':h='if(gt(iw,ih),min(720,ih),-2)'",
+                        "-vf", keep + "scale=w='if(gt(iw,ih),-2,min(720,iw))':h='if(gt(iw,ih),min(720,ih),-2)'",
+                        *mode,
                         "-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{kbps}k", "-pix_fmt", "yuv420p",
                         "-an", out], check=True)
     return out
@@ -254,6 +263,7 @@ def main():
     ap.add_argument("--no-shrink", action="store_true", help="skip the 720p phone shrink (older clips kept their original)")
     ap.add_argument("--direct", action="store_true", help="the phone's 720p file straight into the analyser (T-9378's /analyze-url)")
     ap.add_argument("--shrink-kbps", type=int, default=2500, help="the phone shrink's bitrate (T-9365's low setting is 1500)")
+    ap.add_argument("--shrink-fps", type=int, default=0, help="cap the phone shrink's frame rate (T-9396, D58: 30)")
     a = ap.parse_args()
     exps = json.load(open(a.expect))
     out = a.out or os.path.join(a.clips, "_field_results")
@@ -283,13 +293,13 @@ def main():
             clip = src
             r = analyse(src, tap_norm=tuple(exp["tap"]), rot=rotation_of(src), plate_mm=exp.get("plate_mm", PLATE_MM))
         elif a.direct:
-            clip = src if a.no_shrink else shrink_720(src, work, a.shrink_kbps)
+            clip = src if a.no_shrink else shrink_720(src, work, a.shrink_kbps, a.shrink_fps)
             cap = cv2.VideoCapture(clip); fps = cap.get(cv2.CAP_PROP_FPS) or 30.0; cap.release()
             t0 = time.time()
             r = analyse(clip, tap_norm=tuple(exp["tap"]), rot=rotation_of(clip), width=None,
                         step=direct_step(fps), plate_mm=exp.get("plate_mm", PLATE_MM))
         else:
-            base = src if a.no_shrink else shrink_720(src, work, a.shrink_kbps)
+            base = src if a.no_shrink else shrink_720(src, work, a.shrink_kbps, a.shrink_fps)
             clip, seed = emulate_app(base, work)
             t1 = time.time()
             r = analyse(clip, tap_norm=tuple(exp["tap"]), rot=0, seed_images=seed, width=None,
