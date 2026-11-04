@@ -39,6 +39,7 @@ Results, 4 Nov 2026. v8 and v9 on 47 clips; v10 on the 41 measurable ones
 | v10, app chain (41) | 39 | 1 | 1 | 0 |
 | v10, original into the re-encode (41) | 38 | 0 | 3 | 0 |
 | v10, full resolution (41) | 37 | 0 | 4 | 0 |
+| v10, the phone's 720p file straight in, /analyze-url (41, `--direct`, T-9378) | 38 | 2 | 1 | 0 |
 
 Between the two app encodes v9 changes answer class on 4 clips (v8: 13), and
 mean concentric velocity agrees within 0.03 m/s on 87% of 95 reps.
